@@ -36,6 +36,8 @@ lan-file-share/
 ├─ server.js        # HTTPS server (browse + download + upload + live sync + per-folder share + action log)
 ├─ gen-cert.js      # Generates the self-signed HTTPS cert (with SANs for every LAN IP)
 ├─ start.bat        # [Recommended] one-click start on Windows (auto-generates the cert if missing)
+├─ setup.bat        # [Recommended] one-click setup on Windows (deps + cert + start)
+├─ setup.sh         # One-click setup for Linux / macOS (same steps)
 ├─ config.json      # Config: share folder, port, upload size cap, log level, etc.
 ├─ shares.json      # Records of individual shares (auto-created after first share; password hashes only)
 ├─ package.json     # npm start / npm run cert / npm install dependencies
@@ -50,6 +52,23 @@ lan-file-share/
 ---
 
 ## 2. Quick start (recommended)
+
+### Option 1 — one-click setup (recommended)
+
+Double-click **`setup.bat`** (Windows) or run **`./setup.sh`** in a terminal
+(Linux / macOS). It automatically:
+
+1. Checks that Node.js is installed (and points you to https://nodejs.org/ if not)
+2. Installs the optional dependencies `sharp` / `archiver` / `webdav-server` (skipped if present)
+3. Generates the self-signed HTTPS certificate (skipped if present)
+4. Creates the default `share/` folder if it does not exist
+5. Starts the server and prints the access URLs
+
+> Re-running is safe: completed steps are skipped, nothing is installed twice.
+> If a dependency fails to install the script **does not abort** — it tells you which
+> features are unavailable and the server starts anyway.
+
+### Option 2 — manual
 
 1. Open `config.json` in a **text editor** and change `shareRoot` to the **real
    absolute path** of the folder you want to share, e.g. `D:/SharedFiles`

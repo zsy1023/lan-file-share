@@ -32,6 +32,8 @@ lan-file-share/
 ├─ server.js        # HTTPS 服务器主程序(浏览+下载+上传+实时同步+单独分享+操作日志)
 ├─ gen-cert.js      # 生成自签名 HTTPS 证书(含本机各局域网 IP 的 SAN)
 ├─ start.bat        # 【推荐】Windows 一键启动(缺证书会自动先生成)
+├─ setup.bat        # 【推荐】Windows 一键安装(装依赖 + 生成证书 + 启动)
+├─ setup.sh         # Linux / macOS 一键安装(同上流程)
 ├─ config.json      # 配置:共享目录、端口、上传大小上限、日志级别等
 ├─ shares.json      # 单独分享的记录(首次分享后自动生成;仅存口令哈希)
 ├─ package.json     # npm start / npm run cert / npm install 依赖
@@ -46,6 +48,21 @@ lan-file-share/
 ---
 
 ## 二、快速开始(推荐)
+
+### 方式一:一键安装(推荐)
+
+双击 **`setup.bat`**(Windows)或在终端执行 **`./setup.sh`**(Linux / macOS),它会自动:
+
+1. 检查是否装了 Node.js(没有会提示你去 https://nodejs.org/ 下载)
+2. 安装可选依赖 `sharp` / `archiver` / `webdav-server`(已装则跳过)
+3. 生成 HTTPS 自签名证书(已有则跳过)
+4. 创建默认共享目录 `share/`(若不存在)
+5. 启动服务器并打印访问地址
+
+> 重复运行是安全的:已完成的步骤会自动跳过,不会重复安装。
+> 依赖装不上也**不会中断**:脚本会提示哪些功能不可用,服务器照常启动。
+
+### 方式二:手动
 
 1. 右键用**文本编辑器**打开 `config.json`,把 `shareRoot` 改成你想共享的**真实文件夹**绝对路径,
    例如 `D:/共享文件`(注意用 `/` 分隔;Windows 路径如 `D:\共享文件` 建议写成 `D:/共享文件`)。

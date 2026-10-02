@@ -1,0 +1,25 @@
+# 统一行尾,避免跨平台协作时脚本失效
+# - Windows 批处理必须是 CRLF,否则 cmd 可能报错
+# - Shell 脚本必须是 LF,否则 Linux 上会报 "bad interpreter"
+* text=auto eol=lf
+
+*.bat           text eol=crlf
+*.cmd           text eol=crlf
+*.sh            text eol=lf
+*.ps1           text eol=crlf
+
+# 这些是二进制/生成物,不要做行尾转换
+*.png           binary
+*.jpg           binary
+*.jpeg          binary
+*.gif           binary
+*.ico           binary
+*.pdf           binary
+*.zip           binary
+*.exe           binary
+*.crt           binary
+*.key           binary
+
+# 让 git 在 diff/统计时把以下文件视为生成物
+package-lock.json  -diff linguist-generated
+LICENSE            linguist-vendored
