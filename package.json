@@ -6,7 +6,7 @@
   "license": "GPL-3.0",
   "repository": {
     "type": "git",
-    "url": "git+https://github.com/zsy1023/ile-share.git"
+    "url": "git+https://github.com/zsy1023/lan-file-share.git"
   },
   "main": "server.js",
   "scripts": {
