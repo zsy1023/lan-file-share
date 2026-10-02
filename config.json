@@ -1,0 +1,11 @@
+{
+  "shareRoot": "share",
+  "port": 8443,
+  "certFile": "certs/server.crt",
+  "keyFile": "certs/server.key",
+  "maxUploadMB": 0,
+  "allowOverwrite": true,
+  "logLevel": "normal",
+  "sharePortBase": 9000,
+  "title": "局域网文件共享"
+}

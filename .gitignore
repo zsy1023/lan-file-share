@@ -1,0 +1,14 @@
+node_modules/
+# 证书与私钥
+certs/
+*.pem
+# 单独分享的记录(含口令哈希)
+shares.json
+# 上传临时文件(分片续传状态)与低清预览图
+*.uploading-*
+*.uploading-chunk
+*.uploading-chunk.json
+*.thumb.jpg
+# 默认共享目录里的实际内容(保留目录本身)
+share/*
+!share/.gitkeep
