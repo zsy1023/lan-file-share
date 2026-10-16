@@ -9,6 +9,10 @@ browser to browse the directory tree and **download / upload** files.
 > Highlights: LAN-only, no internet required. The core is dependency-free — just
 > install Node.js and it runs. Three optional dependencies enhance the
 > "low-res preview / ZIP packaging / WebDAV mounting" experience (see the table below).
+> The server listens on **IPv4 + IPv6 (dual stack)** by default — falling back to
+> IPv4-only when the system has IPv6 disabled — and prints every LAN address it has,
+> IPv6 included. You can also add a **root access password** to the main share from
+> the web UI so LAN devices must authenticate first (see [section 7](#7-root-access-password-optional-lan-only)).
 
 ---
 
@@ -33,13 +37,14 @@ Project files:
 
 ```
 lan-file-share/
-├─ server.js        # HTTPS server (browse + download + upload + live sync + per-folder share + action log)
-├─ gen-cert.js      # Generates the self-signed HTTPS cert (with SANs for every LAN IP)
+├─ server.js        # HTTPS server (browse + download + upload + live sync + per-folder share + access password + action log)
+├─ gen-cert.js      # Generates the self-signed HTTPS cert (with SANs for every LAN IPv4 / IPv6 address)
 ├─ start.bat        # [Recommended] one-click start on Windows (auto-generates the cert if missing)
 ├─ setup.bat        # [Recommended] one-click setup on Windows (deps + cert + start)
 ├─ setup.sh         # One-click setup for Linux / macOS (same steps)
 ├─ config.json      # Config: share folder, port, upload size cap, log level, etc.
 ├─ shares.json      # Records of individual shares (auto-created after first share; password hashes only)
+├─ rootauth.json    # Record of the main share's root access password (created when set in the web UI; scrypt hash only)
 ├─ package.json     # npm start / npm run cert / npm install dependencies
 ├─ LICENSE          # Full GPL-3.0 license text
 ├─ README.md        # Chinese documentation
@@ -84,14 +89,31 @@ Double-click **`setup.bat`** (Windows) or run **`./setup.sh`** in a terminal
    ```
    本机访问  : https://localhost:8443/
    局域网访问: https://192.168.1.100:8443/
+   IPv6 访问 : https://[2001:db8:abcd:1234:5a6b:7c8d:9e0f:1a2b]:8443/
+   监听方式  : IPv4 + IPv6 双栈  (IPv6 设备的浏览器可直接访问上面列出的 IPv6 地址)
    ```
 
-   (The first line means "local access"; the second means "LAN access".)
+   (The line labelled "本机访问" is local access, "局域网访问" is LAN access, and
+   "IPv6 访问" lists IPv6 addresses — the last line states that both address families
+   are being served.)
+
+   - **Both IPv4 and IPv6 addresses are listed.** When the machine has an IPv6 address
+     (most home broadband and phone hotspots do), you get `https://[2001:db8:...]:8443/`
+     entries next to the `https://192.168.x.x:8443/` ones — use whichever a given device
+     can reach. IPv6 addresses must be written **inside square brackets** in a URL.
+   - Link-local addresses (`fe80::/10`) need a NIC zone ID (such as `%12`) to be
+     reachable, so the URL would not work when pasted — the startup only reports how
+     many of them exist instead of listing them.
+   - **Nothing breaks on IPv6-less systems**: the server falls back to listening on
+     IPv4 only and says so on the "监听方式" line.
 
 4. On a LAN device (which must be on the same LAN as the computer), open
    `https://192.168.1.100:8443/` in a browser.
 
 > If you change `port`, replace `8443` above with your port.
+> On a LAN device the browser first warns about the self-signed certificate (see
+> section 4); if a **root access password** is set, it also asks for a username /
+> password first (username is irrelevant, only the password matters — see section 7).
 
 ---
 
@@ -117,6 +139,9 @@ Double-click **`setup.bat`** (Windows) or run **`./setup.sh`** in a terminal
 > URL can modify and **permanently delete** content in the shared folder (a browser
 > confirmation appears first). Only expose it on a **trusted LAN**, and be careful:
 > ideally share a dedicated folder rather than scattering all your personal folders.
+> If you don't want every device on the LAN to have direct read/write access, set a
+> **root access password** from the local web UI (section 7); individual shares can
+> have their own passwords too.
 
 ---
 
@@ -168,6 +193,11 @@ Copy `certs/server.crt` from the computer to each device and install it as a
 | `logLevel` | `normal` | Action-log verbosity, see the table below |
 | `sharePortBase` | `9000` | When sharing a folder, ports are auto-allocated upward from this value until a free one is found |
 | `title` | 局域网文件共享 | Page title and top heading |
+
+> The **root access password** is **not** a `config.json` field: it is a runtime
+> setting. Open the web UI **on the local machine** and click "🔒 访问密码" in the
+> top-right to enable / change / remove it — it takes effect immediately and is
+> recorded in `rootauth.json` next to the program (see section 7).
 
 ### Action-log verbosity (`logLevel`)
 
@@ -259,7 +289,46 @@ Expose one subfolder on its own port — ideal for "give just this folder to a f
 
 ---
 
-## 7. Large uploads & previews
+## 7. Root access password (optional, protects LAN access only)
+
+When you don't want every device on the LAN to read and write the shared folder
+directly, put a password in front of the **main share**.
+
+- **How to enable**: open the main page **on the local machine**, click
+  **"🔒 访问密码"** in the top-right, type the new password twice and click
+  "保存密码" (save). It takes effect **immediately** — no restart needed. Click
+  "取消密码保护" to turn it off. (The entry point only exists on the **main share
+  page**; share ports neither show it nor can they call the API behind it.)
+- **How LAN devices use it**: opening `https://<host-ip>:8443/` makes the browser show
+  a username / password dialog (HTTP Basic auth — **the username is ignored, only the
+  password matters**). After authenticating, everything works as usual (browse /
+  download / upload / delete / rename). A wrong password re-prompts; **6 consecutive
+  failures from the same IP are throttled for 60 s** (HTTP 429) so nobody can
+  brute-force it with a script.
+- **The local machine never needs it**: requests from the machine itself (loopback
+  `localhost`, `127.0.0.1`, `::1`, or the machine's own NIC IPs) bypass the prompt —
+  decided from the **TCP peer address**, exactly like "share management is local-only",
+  and a forged `X-Forwarded-For` header does not help.
+- **Main share only**: individual shares keep their own (read-write / read-only)
+  passwords and are unaffected by it. Conversely, **a share without a password stays
+  reachable without one even when the main share is protected** ("the port is the
+  permission") — set a password on that share if you need it.
+- **Where it is stored**: as a **salted scrypt hash in `rootauth.json`** next to the
+  program, **never plaintext**, and it survives restarts. **Forgot it?** Delete
+  `rootauth.json` and restart to disable the protection (or click "取消密码保护" in the
+  local UI if you can still get in).
+- **Logging**: setting/removing it logs `[SHARE] 修改访问密码`; a wrong password from
+  the LAN logs `[DENY] … 根目录访问密码错误或未提供` (denied: root access password
+  missing or wrong), and on success the log's "where" field reads
+  `主共享:8443(凭访问密码)` so you can tell local access from LAN access with the password.
+
+> This is a latch for a **trusted LAN**, **not an account system**: one password for
+> the whole site, no users and no per-user permissions, and no "read-only" mode —
+> for read-only access use a **read-only password** on an individual share (section 6).
+
+---
+
+## 8. Large uploads & previews
 
 ### Chunked upload for large files (resume + auto-retry)
 
@@ -376,7 +445,7 @@ Details:
 
 ---
 
-## 8. Manual CLI (optional)
+## 9. Manual CLI (optional)
 
 ```bash
 node gen-cert.js            # run once, only when there is no certificate (needs openssl)
@@ -389,18 +458,35 @@ npm start                   # start
 
 ---
 
-## 9. Advanced / operations notes
+## 10. Advanced / operations notes
 
 - **Windows firewall**: if other devices cannot connect on first run, make sure the
   TCP port in use is allowed through the system firewall; the browser must visit the
   target computer's **LAN IP**, not `localhost`.
+- **IPv6**: the server listens on **both** address families by default, so the same port
+  works over IPv4 and IPv6.
+  - The Windows firewall treats IPv4 and IPv6 **separately**: if only IPv6 fails, allow
+    the port for IPv6 as well (Advanced Windows Defender Firewall → Inbound Rules, TCP,
+    local port = your port).
+  - **Link-local addresses** (`fe80::/10`) require a NIC zone ID, e.g.
+    `https://[fe80::1a2b:3c4d:5e6f:7a8b%12]:8443/` (browsers also accept `%25`), which is
+    why startup only reports how many exist instead of listing URLs.
+  - The certificate SAN now covers **both IPv4 and IPv6 addresses**, so browsing over
+    IPv6 no longer triggers a "certificate name mismatch"; **temporary IPv6 addresses
+    (privacy extensions) change over time**, though — re-run `node gen-cert.js` when
+    that happens, or simply use the IPv4 address.
+  - On a system with IPv6 disabled the startup line ("监听方式") says IPv4-only and
+    everything keeps working.
 - **Changing the port**: edit `port` in `config.json` and restart — no need to
   regenerate the certificate (it contains IPs, not the port).
 - **Changing subnet / IP**: regenerate the certificate (if the SAN only lists the old
   IP, devices will fail validation).
-- **Public exposure risk**: the program has **no accounts or passwords** and is meant
-  for a trusted LAN only. Do **not** map the port to the internet. If you need
-  concurrent users, rate limiting, or WebSocket-resumable uploads, that can be added later.
+- **Public exposure risk**: the program has **no account system** and is meant for a
+  trusted LAN only. Do **not** map the port to the internet. A root access password
+  (section 7) or per-share passwords can keep casual LAN visitors out, but they are a
+  latch inside a trusted network, not a security measure for the public internet.
+  If you need concurrent users, rate limiting, or WebSocket-resumable uploads, that can
+  be added later.
 - **Live sync**: the service runs a recursive `fs.watch` on the shared folder and also
   broadcasts after every write endpoint; browsers receive it over SSE
   (`/api/events`). If a filesystem does not support recursive watching, a notice is
@@ -417,7 +503,7 @@ npm start                   # start
 
 ---
 
-## 10. Directory-structure security
+## 11. Directory-structure security
 
 - Every request path goes through `realpath` + bounds checking, so `../`,
   symbolic links, or directory junctions cannot reach files outside the shared folder.
@@ -443,6 +529,15 @@ npm start                   # start
   and viewing logs all verify that the TCP peer address belongs to this machine
   (loopback or one of its own NIC IPs); other devices get 403, and forging
   `X-Forwarded-For` has no effect.
+- **Root access password (optional, see section 7)**: once set, **every request from a
+  non-local source** on the main port is challenged with HTTP Basic first. The password
+  is stored as a **salted scrypt hash** (never plaintext) and compared in **constant
+  time**; **6 consecutive failures from one IP trigger a 60 s throttle** (HTTP 429) so
+  it cannot be brute-forced from a script, and concurrent verifications are capped so a
+  flood of attempts cannot stall the service. Local sources (loopback and the machine's
+  own NIC IPs, decided from the TCP peer address) never need the password — the same
+  check used for "share management is local-only" — and the set/remove API is local-only
+  as well.
 - **No nested shares**: an already-shared folder and anything inside it cannot be
   shared again, and this is enforced server-side.
 - **Thumbnails / video covers are internal files**: `<name>.thumb.jpg` never appears
@@ -462,10 +557,12 @@ npm start                   # start
 
 ### Known boundaries (this is a "trusted-LAN tool", not a public service)
 
-- **The main share has no authentication at all**: any device on the LAN can browse,
-  upload, rename, and permanently delete its content; do not map the port to the
-  internet. (Individual shares have an **optional** password, but that is an isolation
-  measure for "sharing with a few people", not a full account system.)
+- **The main share has no authentication by default**: unless a root access password is
+  set, any device on the LAN can browse, upload, rename, and permanently delete its
+  content; and with a password it only **blocks LAN sources** (the local machine stays
+  exempt), with a single password for the whole site and no user/permission tiers.
+  (Individual shares have an **optional** password — read-write or read-only — but that
+  is an isolation measure for "sharing with a few people", not a full account system.)
 - The service reads/writes files as the user who started it and **does not isolate
   permissions**; share only a dedicated directory, never a system-drive root or your
   user directory.
@@ -497,4 +594,9 @@ npm start                   # start
 - ✅ Action log (who / device / where / what / result, three verbosity levels)
 - ✅ Colored terminal logs (color by behavior + level tags, auto-degrades to no color when redirected)
 - ✅ Share management available only locally (loopback and local NIC IPs work; other devices get 403)
-- ✅ Automatic self-signed HTTPS certificate generation (with local LAN IP/SANs)
+- ✅ IPv4 + IPv6 dual-stack listening (share ports and WebDAV too; falls back to IPv4 when the
+  system has no IPv6, and startup lists both address families — link-local only as a count)
+- ✅ Root access password (set from the local web UI, effective immediately, scrypt hash only in
+  `rootauth.json`, LAN 401 challenge / local machine exempt / per-IP failure throttle 429 /
+  live-sync connections dropped the moment it changes)
+- ✅ Automatic self-signed HTTPS certificate generation (SANs for every LAN IPv4 / IPv6 address)

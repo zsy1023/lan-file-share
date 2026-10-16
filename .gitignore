@@ -4,6 +4,8 @@ certs/
 *.pem
 # 单独分享的记录(含口令哈希)
 shares.json
+# 主共享「根目录访问密码」的记录(含口令哈希)
+rootauth.json
 # 上传临时文件(分片续传状态)与低清预览图
 *.uploading-*
 *.uploading-chunk

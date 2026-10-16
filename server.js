@@ -7,11 +7,14 @@
  *   1. 网页目录浏览(面包屑导航、目录/文件列表、大小与修改时间)
  *   2. 文件下载(支持 Range 断点续传)与内联预览(图片/文本/PDF 等)
  *   3. 拖拽 / 选择文件上传到当前目录(流式写盘,不占内存)
- *   4. 全程 HTTPS,配置文件为同目录 config.json
+ *   4. 全程 HTTPS,配置文件为同目录 config.json;默认 IPv4 + IPv6 双栈监听,
+ *      启动时把本机各局域网地址(含 IPv6)都列出来
  *   5. 实时静默同步:任一设备改动,其它正在浏览的页面自动更新
  *   6. 单独分享文件夹:把共享根内某个子文件夹单独开一个端口对外(可选口令),
  *      仅本机网页端可创建/取消,且不支持在已分享的文件夹里再分享一层
- *   7. 操作日志:谁(IP/主机名)从哪里、用什么设备、对什么做了什么
+ *   7. 根目录访问密码(可选):在本机网页端设置后,局域网设备访问主共享要先输入密码,
+ *      本机(回环与本机网卡 IP)按设计免输;密码以 scrypt 哈希存于同目录 rootauth.json
+ *   8. 操作日志:谁(IP/主机名)从哪里、用什么设备、对什么做了什么
  *
  * 使用:
  *   node gen-cert.js   # 首次使用:生成自签名证书(需 openssl)
@@ -20,7 +23,8 @@
  * 安全边界:
  *   - 所有相对路径经 realpath 校验必须落在该监听器的根目录之内,防 ../ 与符号链接逃逸
  *   - 上传文件名不允许包含路径分隔符
- *   - 主子共享无鉴权(可选口令仅对单独分享生效),仅适用于可信局域网;请勿暴露到公网
+ *   - 单独分享可设读写/只读口令;主共享可选「根目录访问密码」(只拦局域网来源,
+ *     本机访问免输);除此之外没有账号体系,仅适用于可信局域网,请勿暴露到公网
  */
 
 const https = require('node:https');
@@ -33,6 +37,7 @@ const { pipeline } = require('node:stream/promises');
 const ROOT_DIR = __dirname;
 const CONFIG_PATH = path.join(ROOT_DIR, 'config.json');
 const STATE_PATH = path.join(ROOT_DIR, 'shares.json'); // 单独分享的持久化记录
+const ROOT_AUTH_PATH = path.join(ROOT_DIR, 'rootauth.json'); // 主共享「根目录访问密码」的持久化记录(只存哈希)
 
 let CONFIG;
 try {
@@ -1093,6 +1098,7 @@ const ACTION_STYLE = {
   sharePwd:    { tag: 'SHARE', tagColor: C.magenta,          text: C.magenta },
   sharePort:   { tag: 'SHARE', tagColor: C.magenta,          text: C.magenta },
   shareWebdav: { tag: 'SHARE', tagColor: C.magenta,          text: C.magenta },
+  rootPwd:     { tag: 'SHARE', tagColor: C.magenta,          text: C.magenta },
   // 异常 / 拒绝
   deny:  { tag: 'DENY',  tagColor: C.bold + C.brightRed,   text: C.brightRed },
   error: { tag: 'ERROR', tagColor: C.bold + C.brightRed,   text: C.brightRed },
@@ -1122,10 +1128,11 @@ const LOG_LABEL = {
   shareAdd: '创建单独分享', shareDel: '取消单独分享', sharePwd: '修改分享口令', sharePort: '修改分享端口',
   shareWebdav: 'WebDAV 开关',
   sharePick: '选择本机文件夹',
+  rootPwd: '修改访问密码',
   deny: '拒绝访问', error: '服务异常',
 };
 // 这些动作属于“写操作”,在 quiet 级别也记录
-const WRITE_ACTIONS = new Set(['upload', 'delete', 'rename', 'mkdir', 'shareAdd', 'shareDel', 'sharePwd', 'sharePort', 'shareWebdav']);
+const WRITE_ACTIONS = new Set(['upload', 'delete', 'rename', 'mkdir', 'shareAdd', 'shareDel', 'sharePwd', 'sharePort', 'shareWebdav', 'rootPwd']);
 // 这些动作只在 verbose 级别记录(高频且信息量低)
 // 这些动作只在 verbose 级别记录(信息量大、正常运行时噪声多)
 // 注意:deny(拒绝访问)不在此列 —— 它是安全信号,normal 级别也应当能看到,
@@ -1201,7 +1208,10 @@ function logAction(info) {
   const who = host && host !== ip ? `${ip}(${host})` : ip || '本机';
   const device = req ? describeUA(req.headers['user-agent']) : '';
   const where = ctx
-    ? (ctx.kind === 'main' ? `主共享:${ctx.port}` : `单独分享「${ctx.title.replace(/ · 单独分享$/, '')}」:${ctx.port}`)
+    ? (ctx.kind === 'main'
+        // 主共享带访问密码时,标注这条日志是“凭密码从局域网进来的”,便于事后核对
+        ? `主共享:${ctx.port}${ctx.viaRootPwd ? '(凭访问密码)' : ''}`
+        : `单独分享「${ctx.title.replace(/ · 单独分享$/, '')}」:${ctx.port}`)
     : '-';
   const target = info.path ? ` /${String(info.path).replace(/^\/+/, '')}` : ' /';
   const ok = info.ok !== false;
@@ -1678,10 +1688,12 @@ function shareInfo(sh) {
   };
 }
 
-/** 某个端口对外可用的访问地址(本机 + 各局域网 IP)。 */
+/** 某个端口对外可用的访问地址(本机 + 各局域网 IPv4/IPv6 地址)。 */
 function shareUrls(port) {
   const urls = [`https://localhost:${port}/`];
-  for (const ip of lanIPs()) urls.push(`https://${ip}:${port}/`);
+  const addrs = lanAddrs();
+  for (const ip of addrs.v4) urls.push(`https://${ip}:${port}/`);
+  for (const ip of addrs.v6) urls.push(`https://${ip}:${port}/`);   // IPv6 已带 [ ]
   return urls;
 }
 
@@ -1871,6 +1883,90 @@ function basicPwd(req) {
   } catch { return null; }
 }
 
+/* ---------------- 访问口令挑战 & 主端口「根目录访问密码」 ---------------- */
+
+/**
+ * 统一的「口令挑战」:没带口令或口令不对 → 401(浏览器会弹出输入框);
+ * 同一 IP 连续试错过多 → 429 退避。这两种情况都已自行写出响应并返回 null,
+ * 调用方拿到 null 直接 return 即可。
+ * 通过校验则返回 { level:'rw'|'ro' },调用方据此决定权限。
+ * verify(pwd) 由调用方给出:单独分享有读写/只读两个口令,主端口只有一个访问密码。
+ */
+function challengeAccess(req, res, ctx, verify, errDetail) {
+  const ip = clientIP(req);
+  if (pwdBlocked(ip)) {
+    res.writeHead(429, { 'Content-Type': 'text/plain; charset=utf-8', 'Retry-After': '60', 'Cache-Control': 'no-store' });
+    logAction({ action: 'deny', ctx, req, ok: false, status: 429, detail: '口令尝试过于频繁' });
+    res.end('口令尝试过于频繁,请稍后再试');
+    return null;
+  }
+  const pwd = basicPwd(req);
+  // scrypt 是同步 CPU 密集操作:限制同时在跑的校验数,避免未认证请求反复触发它拖垮整个进程
+  let role = { level: 'none', matched: false };
+  if (pwd !== null && pwdInFlight < PWD_MAX_CONCURRENT) {
+    pwdInFlight++;
+    try { role = verify(pwd); } finally { pwdInFlight--; }
+  }
+  if (!role.matched) {
+    if (pwd !== null) notePwdFail(ip);
+    res.writeHead(401, {
+      'WWW-Authenticate': 'Basic realm="lan-file-share", charset="UTF-8"',
+      'Content-Type': 'text/plain; charset=utf-8',
+      'Cache-Control': 'no-store',
+    });
+    logAction({ action: 'deny', ctx, req, ok: false, status: 401, detail: errDetail || '口令错误或未提供' });
+    res.end('需要访问口令');
+    return null;
+  }
+  notePwdOk(ip);
+  return role;
+}
+
+/* ---- 主端口「根目录访问密码」---- */
+
+/**
+ * 局域网访问主共享所需的密码,只能在本机网页端设置(见 handleShareApi 里的 /api/rootpwd)。
+ * 哈希与单独分享口令共用同一套 scrypt 方案,持久化在 rootauth.json;空串表示未启用。
+ * 本机(回环与本机网卡 IP)按设计免输,判定见 isLocalRequest —— 与「分享管理仅限本机」一致。
+ */
+let rootPwdHash = '';
+
+function loadRootAuth() {
+  try {
+    const raw = JSON.parse(fs.readFileSync(ROOT_AUTH_PATH, 'utf8'));
+    rootPwdHash = typeof raw.pwdHash === 'string' ? raw.pwdHash : '';
+  } catch { rootPwdHash = ''; }   // 从没设置过(或文件被手工删掉)视为未启用
+}
+
+/** 落盘。取消密码时删除文件,不留空壳;写入失败抛 HttpError,由调用方回滚内存状态。 */
+function saveRootAuth() {
+  try {
+    if (!rootPwdHash) { try { fs.rmSync(ROOT_AUTH_PATH, { force: true }); } catch {} return; }
+    fs.writeFileSync(ROOT_AUTH_PATH, JSON.stringify({ pwdHash: rootPwdHash }, null, 2), 'utf8');
+  } catch (e) {
+    throw new HttpError(500, `无法保存访问密码(${ROOT_AUTH_PATH}):${e.message}`);
+  }
+}
+
+/** 设置 / 取消根目录访问密码(传空串表示取消)。落盘成功才生效,并立即踢掉已连着的局域网会话。 */
+function setRootPwd(password) {
+  const prev = rootPwdHash;
+  rootPwdHash = password ? hashPwd(password) : '';
+  try {
+    saveRootAuth();
+  } catch (e) {
+    rootPwdHash = prev;   // 回滚:不能出现“界面上显示已设置、重启后却没了”
+    throw e;
+  }
+  dropSessions('main');   // 断开主端口已建立的 SSE,客户端下一次请求就会要求(重新)输入密码
+}
+
+/** 校验主端口访问密码:只有一个密码,命中即读写权限。 */
+function verifyRootPwd(pwd) {
+  const hit = !!rootPwdHash && verifyPwd(pwd, rootPwdHash);
+  return { level: hit ? 'rw' : 'none', matched: hit };
+}
+
 /** 找一个当前空闲的端口(从 sharePortBase 起试)。 */
 async function findFreePort(start) {
   const net = require('node:net');
@@ -2045,26 +2141,24 @@ function assertRelSegmentsAll(rel) {
   for (const seg of rel.split('/')) assertRelSegment(seg);
 }
 
-/** 为一个分享启动独立 HTTPS 监听。 */
+/** 为一个分享启动独立 HTTPS 监听(IPv4 + IPv6 双栈,IPv6 不可用时自动退回 IPv4)。 */
 function listenShare(sh) {
   return new Promise((resolve, reject) => {
     const server = https.createServer(
       { cert: fs.readFileSync(CERT_FILE), key: fs.readFileSync(KEY_FILE) },
       (req, res) => handleRequest(makeCtxShare(sh), req, res)
     );
-    server.on('error', (e) => {
-      server.removeAllListeners('error');
-      if (!server.listening) reject(e);
-      else errorLine(`分享「${sh.name}」(端口 ${sh.port}) 出错: ${e.message}`);
-    });
-    server.listen(sh.port, () => {
-      server.off('error', () => {});
-      server.on('error', (e) => errorLine(`分享「${sh.name}」监听出错: ${e.message}`));
+    let settled = false;
+    listenDual(server, sh.port, () => {
+      settled = true;
       shareServers.set(sh.id, server);
       note('单独分享  ', paint(`「${sh.name}」`, C.bold + C.magenta)
         + ' ' + paint(`https://localhost:${sh.port}/`, C.bold + C.brightGreen)
         + paint(`  (${sh.rel})`, C.dim));
       resolve(server);
+    }, (e) => {
+      if (!settled) { settled = true; reject(e); }
+      else errorLine(`分享「${sh.name}」(端口 ${sh.port}) 出错: ${e.message}`);
     });
   });
 }
@@ -2093,19 +2187,19 @@ function setSharePwd(sh, password) {
   sh.pwdHash = password ? hashPwd(password) : '';
   saveShares();
   // 口令变化后,该端口上已建立的 SSE 长连接应断开,迫使客户端重新认证
-  dropShareSessions(sh.id);
+  dropSessions(sh.id);
 }
 
 /** 修改某个分享的只读口令(传空字符串表示取消只读口令)。 */
 function setShareRoPwd(sh, roPassword) {
   sh.roHash = roPassword ? hashPwd(roPassword) : '';
   saveShares();
-  dropShareSessions(sh.id);
+  dropSessions(sh.id);
 }
 
-/** 断开某个分享端口上已建立的 SSE 长连接(口令或权限变化后强制重新认证)。 */
-function dropShareSessions(shareId) {
-  for (const c of [...sseClients]) if (c.scope === shareId) { try { c.res.end(); } catch {} sseClients.delete(c); }
+/** 断开某个作用域上已建立的 SSE 长连接(口令或权限变化后强制重新认证)。scope 为 'main' 或 shareId。 */
+function dropSessions(scope) {
+  for (const c of [...sseClients]) if (c.scope === scope) { try { c.res.end(); } catch {} sseClients.delete(c); }
 }
 
 /**
@@ -2129,7 +2223,7 @@ async function setSharePort(sh, newPort) {
   if (retry) { clearInterval(retry); shareRetryTimers.delete(sh.id); }
   if (oldServer) {
     shareServers.delete(sh.id);
-    for (const c of [...sseClients]) if (c.scope === sh.id) { try { c.res.end(); } catch {} sseClients.delete(c); }
+    dropSessions(sh.id);
     oldServer.closeAllConnections?.();
     await new Promise((r) => oldServer.close(() => r()));
   }
@@ -2248,7 +2342,8 @@ async function startWebdav(sh) {
 
   const server = new lib.WebDAVServer({
     port,
-    hostname: '0.0.0.0',
+    // 与网页端保持一致:能用 IPv6 就用 '::'(双栈),否则退回 IPv4
+    hostname: ipv6Available() ? '::' : '0.0.0.0',
     https: { cert: fs.readFileSync(CERT_FILE), key: fs.readFileSync(KEY_FILE) },
     httpAuthentication: auth,
     privilegeManager: privileges,
@@ -2616,6 +2711,7 @@ const PAGE_HTML = `<!DOCTYPE html>
   <span id="live" title="实时同步:共享目录或其它设备的改动会自动显示"><span class="dot"></span><span id="liveText">连接中…</span></span>
   <span class="hdr-actions" id="hdrActions" style="display:none">
     <button class="btn-sm" id="btnSharePanel" type="button" title="查看与管理已单独分享的文件夹">🔗 单独分享 <span class="cnt" id="shareCnt" style="display:none">0</span></button>
+    <button class="btn-sm" id="btnPwdPanel" type="button" title="设置局域网访问本共享根所需的密码">🔒 访问密码</button>
     <button class="btn-sm" id="btnLog" type="button" title="查看最近的操作日志">📋 操作日志</button>
   </span>
   <span id="headerPath" style="color:var(--mut);font-size:13px"></span>
@@ -2635,6 +2731,31 @@ const PAGE_HTML = `<!DOCTYPE html>
   <section id="logPanel" class="panel" style="display:none">
     <h2>📋 最近操作日志 <span class="sub" id="logSub"></span></h2>
     <div class="body" id="logList"><div class="log-row"><span class="d">加载中…</span></div></div>
+  </section>
+
+  <section id="pwdPanel" class="panel" style="display:none">
+    <h2>🔒 根目录访问密码 <span class="sub">开启后,局域网设备打开本页要先输入密码;本机访问免输</span></h2>
+    <div class="body">
+      <div id="pwdState" class="empty-hint">加载中…</div>
+      <div class="field" style="margin-top:12px">
+        <label>新密码(留空则不修改)</label>
+        <input type="password" id="pwdNew" placeholder="建议 8 位以上,别用太简单的" autocomplete="new-password">
+        <label style="margin-top:9px">再输一次</label>
+        <input type="password" id="pwdNew2" placeholder="两次输入需一致" autocomplete="new-password">
+        <div class="hintline">
+          密码以 scrypt 哈希保存在本目录的 <code>rootauth.json</code>(不存明文);
+          保存后<b>立即生效</b>,重启服务也依然有效。忘记密码时删掉该文件即可关闭密码保护。
+        </div>
+        <div class="hintline">
+          只有<b>主共享</b>(本页)受它保护;「单独分享」的文件夹另有各自的口令,不受影响。
+        </div>
+      </div>
+      <div style="display:flex; gap:8px; flex-wrap:wrap; align-items:center">
+        <button class="btn-sm" id="pwdSave" type="button">保存密码</button>
+        <button class="btn-sm" id="pwdClear" type="button">取消密码保护</button>
+        <span class="hintline" id="pwdMsg"></span>
+      </div>
+    </div>
   </section>
 
   <div id="drop">
@@ -4118,6 +4239,70 @@ async function loadLogs(){
   }
 }
 
+/* ---------- 根目录访问密码(仅主端口/本机可设置) ---------- */
+async function loadPwdState(){
+  try{
+    const r = await fetch("/api/rootpwd");
+    const j = await r.json();
+    if(!r.ok) throw new Error(j.error||("HTTP "+r.status));
+    renderPwdState(!!j.enabled);
+  }catch(e){
+    const box=$("pwdState");
+    box.textContent = "无法读取密码状态: "+e.message;
+    box.style.color = "#dc2626";
+  }
+}
+function renderPwdState(on){
+  const box=$("pwdState");
+  box.textContent = on
+    ? "✅ 已启用:局域网设备打开本页会先要求输入密码(本机访问免输)。"
+    : "⚪ 未启用:任何能访问本机端口的设备都可浏览、下载、上传、删除。";
+  box.style.color = on ? "#15803d" : "";
+}
+function pwdMsg(text, bad){
+  const el=$("pwdMsg");
+  el.textContent = text || "";
+  el.style.color = bad ? "#dc2626" : "#15803d";
+}
+async function submitPwd(clear){
+  const a=$("pwdNew").value, b=$("pwdNew2").value;
+  if(clear){
+    if(!confirm("确定取消密码保护吗?取消后局域网内任何设备都能直接读写共享目录。")) return;
+  }else{
+    if(!a){ pwdMsg("请先输入新密码(留空表示不修改)", true); return; }
+    if(a!==b){ pwdMsg("两次输入的密码不一致", true); return; }
+  }
+  const btn = clear ? $("pwdClear") : $("pwdSave");
+  btn.disabled = true;
+  pwdMsg(clear ? "正在取消…" : "正在保存…", false);
+  try{
+    const r = await fetch("/api/rootpwd", {
+      method:"POST", headers:{"Content-Type":"application/json"},
+      body: JSON.stringify({ password: clear ? "" : a })
+    });
+    const j = await r.json().catch(()=>({}));
+    if(!r.ok || !j.ok) throw new Error(j.error||("HTTP "+r.status));
+    $("pwdNew").value=""; $("pwdNew2").value="";
+    renderPwdState(!!j.enabled);
+    pwdMsg(j.enabled ? "密码已保存,局域网访问立即生效" : "已取消密码保护(局域网恢复免密访问)", false);
+  }catch(e){
+    pwdMsg("操作失败: "+e.message, true);
+  }finally{
+    btn.disabled = false;
+  }
+}
+function initPwdUi(){
+  if(!CAN_SHARE) return;                       // 单独分享端口:不显示管理入口
+  $("btnPwdPanel").addEventListener("click", async ()=>{
+    const p=$("pwdPanel");
+    p.style.display = p.style.display==="none" ? "" : "none";
+    if(p.style.display!=="none") await loadPwdState();
+  });
+  $("pwdSave").addEventListener("click", ()=>submitPwd(false));
+  $("pwdClear").addEventListener("click", ()=>submitPwd(true));
+  $("pwdNew2").addEventListener("keydown", (e)=>{ if(e.key==="Enter") submitPwd(false); });
+}
+
 function initShareUi(){
   if(!CAN_SHARE) return;                       // 单独分享端口:不显示管理入口
   $("hdrActions").style.display = "";
@@ -4175,6 +4360,7 @@ initLightbox();
 initReadonly();
 initBulkDownload();
 initShareUi();
+initPwdUi();
 </script>
 </body>
 </html>`;
@@ -4387,6 +4573,29 @@ async function handleShareApi(ctx, req, res, url) {
     return sendJson(res, 200, { ok: true, level: LOG_LEVEL, logs: recentLogs.slice(-120).reverse() });
   }
 
+  // 根目录访问密码:查看状态 / 设置或取消。只有本机能改(局域网设备既看不到入口也调不动接口)
+  if (req.method === 'GET' && p === '/api/rootpwd') {
+    if (!requireLocal(ctx, req, res, 'deny')) return;
+    return sendJson(res, 200, { ok: true, enabled: !!rootPwdHash });
+  }
+  if (req.method === 'POST' && p === '/api/rootpwd') {
+    if (!requireLocal(ctx, req, res, 'deny')) return;
+    const body = await readJsonBody(req);
+    const pw = typeof body.password === 'string' ? body.password : '';
+    try {
+      setRootPwd(pw);
+    } catch (e) {
+      const status = e instanceof HttpError ? e.status : 500;
+      logAction({ action: 'rootPwd', ctx, req, ok: false, status, detail: e.message });
+      return sendJson(res, status, { ok: false, error: e.message });
+    }
+    logAction({
+      action: 'rootPwd', ctx, req, ok: true,
+      detail: pw ? '已设置根目录访问密码(局域网访问需输入)' : '已取消根目录访问密码',
+    });
+    return sendJson(res, 200, { ok: true, enabled: !!rootPwdHash });
+  }
+
   throw new HttpError(404, '接口不存在');
 }
 
@@ -4397,6 +4606,14 @@ async function handleRequest(ctx, req, res) {
   const p = url.pathname;
   const started = Date.now();
 
+  // 主端口「根目录访问密码」:只拦局域网来的请求,本机(回环与本机网卡 IP)免输
+  if (ctx.kind === 'main' && rootPwdHash && !isLocalRequest(req)) {
+    const role = challengeAccess(req, res, ctx, verifyRootPwd, '根目录访问密码错误或未提供');
+    if (!role) return;
+    ctx.role = role.level;
+    ctx.viaRootPwd = true;   // 供日志区分“本机直连”与“局域网凭密码进入”
+  }
+
   // 单独分享端口的口令校验(未设口令则直接放行)
   if (ctx.kind === 'share') {
     const sh = shares.get(ctx.shareId);
@@ -4406,30 +4623,8 @@ async function handleRequest(ctx, req, res) {
       return res.end('该分享已取消');
     }
     if (sh.pwdHash || sh.roHash) {
-      const ip = clientIP(req);
-      if (pwdBlocked(ip)) {
-        res.writeHead(429, { 'Content-Type': 'text/plain; charset=utf-8', 'Retry-After': '60', 'Cache-Control': 'no-store' });
-        logAction({ action: 'deny', ctx, req, ok: false, status: 429, detail: '口令尝试过于频繁' });
-        return res.end('口令尝试过于频繁,请稍后再试');
-      }
-      const pwd = basicPwd(req);
-      // scrypt 是同步 CPU 密集操作:限制同时在跑的校验数,避免未认证请求拖垮整个进程
-      let role = { level: 'none', matched: false };
-      if (pwd !== null && pwdInFlight < PWD_MAX_CONCURRENT) {
-        pwdInFlight++;
-        try { role = verifyPwdRole(sh, pwd); } finally { pwdInFlight--; }
-      }
-      if (!role.matched) {
-        if (pwd !== null) notePwdFail(ip);
-        res.writeHead(401, {
-          'WWW-Authenticate': 'Basic realm="lan-file-share", charset="UTF-8"',
-          'Content-Type': 'text/plain; charset=utf-8',
-          'Cache-Control': 'no-store',
-        });
-        logAction({ action: 'deny', ctx, req, ok: false, status: 401, detail: '口令错误或未提供' });
-        return res.end('需要访问口令');
-      }
-      notePwdOk(ip);
+      const role = challengeAccess(req, res, ctx, (pwd) => verifyPwdRole(sh, pwd));
+      if (!role) return;
       // 命中只读口令:整个请求期间 ctx.role='ro',下面会拦掉所有写操作
       ctx.role = role.level;
       ctx.viaRoPwd = role.level === 'ro';
@@ -4474,8 +4669,8 @@ async function handleRequest(ctx, req, res) {
     if (req.method === 'GET' && p === '/api/events') {
       return handleEvents(ctx, req, res);
     }
-    // 分享管理 / 日志查看:仅本机网页端
-    if (p.startsWith('/api/share/') || p === '/api/log/recent') {
+    // 分享管理 / 日志查看 / 根目录访问密码:仅本机网页端
+    if (p.startsWith('/api/share/') || p === '/api/log/recent' || p === '/api/rootpwd') {
       return await handleShareApi(ctx, req, res, url);
     }
     if ((req.method === 'GET' || req.method === 'HEAD') && (p === '/download' || p === '/raw')) {
@@ -4543,14 +4738,75 @@ async function handleRequest(ctx, req, res) {
 
 /* ---------------- 启动 ---------------- */
 
-function lanIPs() {
-  const out = [];
+/**
+ * 双栈监听:先尝试绑定 IPv6 通配地址 '::' —— 内核会把 IPv4-mapped 连接一并交给它,
+ * 于是同一端口同时接受 IPv6 与 IPv4 连接;系统没有启用 IPv6 时自动退回
+ * '0.0.0.0'(仅 IPv4),保证服务总能起来。
+ * onReady(dualStack) 在任一次绑定成功后调用;onFatal 收到的是真正的监听错误(如端口占用)。
+ */
+const IPV6_UNAVAILABLE_CODES = new Set(['EAFNOSUPPORT', 'EPROTONOSUPPORT', 'EADDRNOTAVAIL', 'EINVAL', 'ENOTSUP']);
+
+function listenDual(server, port, onReady, onFatal) {
+  // onFatal 没传时兜底:打印错误并退出,避免“端口占用”变成难懂的 TypeError
+  const fatal = typeof onFatal === 'function' ? onFatal : (e) => {
+    errorLine(e && e.message ? e.message : String(e));
+    process.exit(1);
+  };
+  let fellBack = false;
+  server.on('error', (e) => {
+    if (!fellBack && e && IPV6_UNAVAILABLE_CODES.has(e.code)) {
+      fellBack = true;                    // IPv6 不可用:退回仅 IPv4,不让服务起不来
+      server.listen(port, '0.0.0.0');
+      return;
+    }
+    fatal(e);
+  });
+  server.once('listening', () => {
+    const addr = server.address();
+    onReady(!!(addr && addr.family === 'IPv6'));
+  });
+  server.listen({ port, host: '::', ipv6Only: false });
+}
+
+/** 本机 IPv6 协议栈是否可用(有 IPv6 回环地址即可认为可用)。 */
+function ipv6Available() {
+  for (const list of Object.values(os.networkInterfaces())) {
+    for (const it of list || []) if (it && it.family === 'IPv6' && it.internal) return true;
+  }
+  return false;
+}
+
+/** fe80::/10 是链路本地地址。 */
+function isLinkLocalV6(addr) {
+  const a = String(addr).toLowerCase();
+  return a.startsWith('fe8') || a.startsWith('fe9') || a.startsWith('fea') || a.startsWith('feb');
+}
+
+/**
+ * 列出本机可用于局域网访问的地址,IPv4 与 IPv6 分开:
+ *   - v4:形如 "192.168.1.5"
+ *   - v6:可直接拼进 URL 的 "[2001:db8:abcd:1234:5a6b:7c8d:9e0f:1a2b]" 形式
+ *   - v6LinkLocal:链路本地地址(fe80::/10)的个数。这类地址必须带上网卡作用域 ID
+ *     (%以太网 / %15)才能访问,直接给出 URL 反而点不开,所以只报个数。
+ * 另外跳过 Teredo(2001:0::/32):那是 NAT 穿透隧道地址,不能当局域网地址使用。
+ */
+function lanAddrs() {
+  const v4 = [];
+  const v6 = [];
+  let v6LinkLocal = 0;
   for (const list of Object.values(os.networkInterfaces())) {
     for (const it of list || []) {
-      if (it.family === 'IPv4' && !it.internal) out.push(it.address);
+      if (!it || it.internal) continue;
+      if (it.family === 'IPv4') { v4.push(it.address); continue; }
+      if (it.family !== 'IPv6') continue;
+      const addr = String(it.address).split('%')[0];   // 去掉 %scopeid
+      if (isLinkLocalV6(addr)) { v6LinkLocal++; continue; }
+      if (/^2001:0:/i.test(addr)) continue;            // Teredo 隧道地址
+      v6.push(`[${addr}]`);
     }
   }
-  return out;
+  const uniq = (a) => [...new Set(a)].sort();
+  return { v4: uniq(v4), v6: uniq(v6), v6LinkLocal };
 }
 
 /**
@@ -4619,13 +4875,14 @@ function main() {
   }
 
   loadShares();
+  loadRootAuth();
 
   const server = https.createServer(
     { cert: fs.readFileSync(CERT_FILE), key: fs.readFileSync(KEY_FILE) },
     (req, res) => handleRequest(makeCtxMain(), req, res)
   );
 
-  server.on('error', (e) => {
+  const onListenError = (e) => {
     if (e.code === 'EADDRINUSE') {
       errorLine(`端口 ${PORT} 已被占用。可在 ${CONFIG_PATH} 中修改 "port"。`);
     } else if (e.code === 'EACCES' || e.code === 'EPERM') {
@@ -4634,22 +4891,34 @@ function main() {
       errorLine(e && e.message ? e.message : String(e));
     }
     process.exit(1);
-  });
+  };
 
-  server.listen(PORT, async () => {
+  // 双栈监听:IPv6 与 IPv4 共用同一个端口(系统未启用 IPv6 时自动退回仅 IPv4)
+  listenDual(server, PORT, async (dualStack) => {
     const bar = '═'.repeat(52);
     console.log(paint(bar, C.cyan));
     console.log(paint('  📁 局域网文件共享  ', C.bold + C.brightCyan) + paint('已启动', C.green));
     console.log(paint(bar, C.cyan));
     note('共享目录  ', paint(SHARE_ROOT, C.bold));
-    const ips = lanIPs();
+    const addrs = lanAddrs();
     const url = (h) => paint(`https://${h}:${PORT}/`, C.bold + C.brightGreen);
-    if (ips.length === 0) {
+    if (addrs.v4.length === 0 && addrs.v6.length === 0) {
       note('访问地址  ', url('localhost'));
     } else {
       note('本机访问  ', url('localhost'));
-      for (const ip of ips) note('局域网访问', url(ip));
+      for (const ip of addrs.v4) note('局域网访问', url(ip));
+      // IPv6 地址一律写成 [地址] 形式,直接粘进浏览器即可
+      for (const ip of addrs.v6) note('IPv6 访问 ', url(ip));
     }
+    if (addrs.v6LinkLocal) {
+      note('IPv6 提示 ', paint(`另有 ${addrs.v6LinkLocal} 个链路本地地址(fe80::/10):需带网卡作用域 ID 才能访问,故未列出`, C.dim));
+    }
+    note('监听方式  ', dualStack
+      ? paint('IPv4 + IPv6 双栈', C.green) + paint('  (IPv6 设备的浏览器可直接访问上面列出的 IPv6 地址)', C.dim)
+      : paint('仅 IPv4', C.yellow) + paint('  (系统未启用 IPv6,已退回 IPv4 监听)', C.dim));
+    note('访问密码  ', rootPwdHash
+      ? paint('已启用', C.green) + paint('  (局域网设备打开网页会要求输入密码;本机免输,可在网页右上角「🔒 访问密码」里改)', C.dim)
+      : paint('未启用', C.dim) + paint('  (局域网内任何设备都能直接读写;可在网页右上角「🔒 访问密码」里设置)', C.dim));
     note('证书文件  ', paint(CERT_FILE, C.gray) + paint('  (分发给局域网设备并信任,可消除浏览器警告)', C.dim));
     note('实时同步  ', paint('已开启', C.green) + paint(' —— 共享目录内容变化时,正在浏览的页面会自动静默更新', C.dim));
     note('操作日志  ', paint(LOG_LEVEL, C.bold) + paint('  (可改 config.json 的 logLevel: quiet/normal/verbose)', C.dim));
@@ -4663,7 +4932,7 @@ function main() {
     console.log(paint(bar, C.cyan));
     console.log(paint('  按 Ctrl+C 停止', C.dim));
     console.log(paint(bar, C.cyan));
-  });
+  }, onListenError);
 }
 
 /** 启动时恢复 shares.json 里的单独分享;某个端口起不来只跳过该条。 */

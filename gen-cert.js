@@ -1,7 +1,7 @@
 'use strict';
 
 /**
- * gen-cert.js —— 用系统 openssl 生成自签名证书(含本机局域网 IP 的 SAN)
+ * gen-cert.js —— 用系统 openssl 生成自签名证书(含本机局域网 IPv4 / IPv6 地址的 SAN)
  *
  * 用法: node gen-cert.js [额外IP ...]
  * 需要 openssl 在 PATH 中(Windows 上 Git Bash / Win64 OpenSSL 自带)。
@@ -18,11 +18,24 @@ const CONFIG = JSON.parse(fs.readFileSync(path.join(ROOT_DIR, 'config.json'), 'u
 const CERT_FILE = path.resolve(ROOT_DIR, CONFIG.certFile || 'certs/server.crt');
 const KEY_FILE = path.resolve(ROOT_DIR, CONFIG.keyFile || 'certs/server.key');
 
+/**
+ * 收集要写进证书 SAN 的地址:IPv4 与 IPv6 **都收**。
+ *   - IPv6 一律去掉 %scopeid(证书里不接受作用域);链路本地地址也照样写上,
+ *     这样带作用域访问(如 https://[fe80::1%以太网]:8443/)时地址部分仍能匹上。
+ *   - Teredo 隧道地址(2001:0::/32)不是真正的局域网地址,跳过。
+ * 不写 IPv6 的话,用 https://[2001:db8::1234]:8443/ 打开会报「证书名称不匹配」,
+ * 即使把证书装进了信任库也仍然报警告。
+ */
 function lanIPs() {
-  const out = new Set(['127.0.0.1']);
+  const out = new Set(['127.0.0.1', '::1']);
   for (const list of Object.values(os.networkInterfaces())) {
     for (const it of list || []) {
-      if (it.family === 'IPv4' && !it.internal) out.add(it.address);
+      if (!it || it.internal) continue;
+      if (it.family === 'IPv4') { out.add(it.address); continue; }
+      if (it.family !== 'IPv6') continue;
+      const addr = String(it.address).split('%')[0];
+      if (/^2001:0:/i.test(addr)) continue;   // Teredo 隧道地址
+      out.add(addr);
     }
   }
   return [...out];
@@ -35,7 +48,7 @@ function main() {
     process.exit(1);
   }
 
-  const cn = ips.find((ip) => ip !== '127.0.0.1') || ips[0];
+  const cn = ips.find((ip) => ip !== '127.0.0.1' && ip !== '::1') || ips[0];
   const san = ['DNS:localhost', ...ips.map((ip) => `IP:${ip}`)].join(',');
 
   fs.mkdirSync(path.dirname(CERT_FILE), { recursive: true });
