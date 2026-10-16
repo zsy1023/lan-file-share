@@ -1,6 +1,6 @@
 {
   "name": "lan-file-share",
-  "version": "1.0.0",
+  "version": "1.1.0",
   "private": true,
   "description": "局域网 HTTPS 文件共享服务器:网页浏览、上传下载、批量打包、实时同步、单独分享文件夹",
   "license": "GPL-3.0",
