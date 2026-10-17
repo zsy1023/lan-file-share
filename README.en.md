@@ -122,8 +122,9 @@ Double-click **`setup.bat`** (Windows) or run **`./setup.sh`** in a terminal
 | Action | How |
 |------|------|
 | Download | Click a file name to download; for images click the thumbnail to enlarge (**a low-res preview opens instantly, then the full-res original replaces it automatically**); for videos click the cover to play inline |
+| **Text preview** | Text files (txt / logs / md / json / code …) have a **"预览"** (preview) button on the right — or click the 📄 icon in the grid views — to read them in the page without downloading; only the first 1 MB is read and UTF-8 / GBK are detected automatically |
 | New folder | Toolbar **"＋ New folder"** creates a folder in the current directory (hidden for read-only access) |
-| **Batch download** | Every row / tile has a checkbox; tick the ones you want and click **"⬇ Download selected"** to package them into one ZIP. "Select all" packages the whole current directory. Folders are packaged **recursively** (including all nested files). Once ready, the download **supports resume** (interrupted transfers continue) |
+| **Batch download** | Every row / tile has a checkbox; tick the ones you want and click **"⬇ Download selected"**: **a single selected file downloads directly (no packaging)**; several items or a folder get packaged into one ZIP. Folders are packaged **recursively** (including all nested files). The download shows **real progress** (transferred / total / percent) and **supports resume** (interrupted transfers continue) |
 | View | The top toolbar switches between "list / icons / tiles / thumbnails" and a slider adjusts icon size; the choice is remembered |
 | Upload files | Click "Choose files to upload" at the top **or drag files onto the page**; multiple selection is supported and same-named files are overwritten. **Large files are transferred in chunks with resume and automatic retry** (see below) |
 | Upload folder | Click "📂 Upload folder" at the top and pick a whole folder; the program recreates the original directory structure (empty subfolders are not created) |
@@ -384,6 +385,25 @@ With **ffmpeg** installed (optional), videos get a cover image too:
 > The startup log reports "video cover: enabled / disabled".
 > If ffmpeg is not on `PATH`, point `FFMPEG_PATH` at its full path.
 
+### Text preview (txt / logs / configs / code)
+
+Read a file's content without downloading it first:
+
+- Text files have a **"预览"** (preview) button on the right of the row; in the icon /
+  tile / thumbnail views you can also click the 📄 icon.
+- Supported: `txt` `log` `md` `json` `csv` `xml` `yml` `ini` `conf` `sql` `js` `css`
+  `html` `bat` `ps1` `sh` `py` `java` `c` `cpp` `go` `rs` and friends, plus
+  extension-less files such as `README` / `LICENSE` / `Dockerfile` / `.gitignore`.
+- The preview is a **read-only** monospace view (long lines wrap, the box scrolls);
+  ← / → move through images, videos and text files in the same directory, Esc or a
+  click on the background closes it.
+- **Only the first 1 MB is read**, so huge logs cannot freeze the browser; beyond that
+  a notice says "only the first 1 MB is shown, download for the full file".
+- **Encoding is detected**: UTF-8 first, falling back to GB18030 — text files saved by
+  Notepad on a Chinese Windows are usually GBK, which would look garbled as UTF-8.
+- Content is rendered with `textContent` (never `innerHTML`), so HTML/JS files show up as
+  **source text** and are never executed (no XSS).
+
 ### Preview caching (ETag / 304)
 
 Both preview originals and thumbnails carry `ETag` and `Last-Modified`:
@@ -408,7 +428,11 @@ When you want to take away several files or a whole folder at once:
 
 1. **Tick** the items you need in any view — every row has a checkbox at its start and
    every tile has one at its top-left; "Select all" picks the whole current directory.
-2. Click **"⬇ Download selected"** in the toolbar and the browser downloads a ZIP.
+2. Click **"⬇ Download selected"** in the toolbar:
+   - **exactly one file ticked** → the original file downloads **directly, without packaging**
+     (no waiting for packaging, no temporary disk usage);
+   - **several items, or a folder** → the server packages a ZIP first (a folder has to be
+     packaged to be taken away in one go).
 
 Details:
 
@@ -424,12 +448,21 @@ Details:
 - At most 500 items at a time.
 - Package name: the item's name for a single selection; otherwise
   `current_dir_name_item_count.zip`.
-- **Supports resume**: when packaging finishes you download an ordinary file URL
-  (with `Accept-Ranges`), so an **interrupted, paused, or closed-and-reopened**
-  download continues instead of restarting; multi-threaded download tools work too.
-- **Two-phase flow**: the server first packages the ZIP (the page shows
-  "processed N of M items"), then the download starts. Large directories therefore
-  wait a while before transferring — the trade-off for resumable downloads.
+- **Packaging is fast**: over a LAN there is no point burning CPU to save a few bytes —
+  formats that are already compressed (jpg / png / mp4 / mp3 / zip / pdf / docx / apk …)
+  are **stored** without a second compression pass, everything else uses the **fastest**
+  deflate level. Measured: 220 files / 160 MB went from 7.2 s to 0.7 s (≈220 MB/s, i.e.
+  disk speed), while text still compresses to about 1% of its original size.
+- **The progress follows the real transfer**: during packaging the page shows
+  "processed N of M items"; once the download starts it shows
+  **"downloading… 12.3 MB / 160.1 MB (8%)"**, and "download complete" appears only when
+  the transfer has actually finished. An interruption immediately shows "download
+  interrupted…" and clicking again resumes.
+- **Supports resume**: the download is an ordinary file URL (with `Accept-Ranges`), so an
+  **interrupted, paused, or closed-and-reopened** download continues instead of
+  restarting; multi-threaded download tools work too.
+- **Two-phase flow**: the server first packages the ZIP, then the download starts — the
+  trade-off for resumable downloads.
 - **Packages are reused**: clicking "Download selected" again with the same selection
   within 6 hours reuses the existing package instead of repacking.
 
@@ -599,4 +632,12 @@ npm start                   # start
 - ✅ Root access password (set from the local web UI, effective immediately, scrypt hash only in
   `rootauth.json`, LAN 401 challenge / local machine exempt / per-IP failure throttle 429 /
   live-sync connections dropped the moment it changes)
+- ✅ Text preview (txt / logs / configs / code, read-only, first 1 MB only, UTF-8 → GB18030
+  fallback, rendered via `textContent` so nothing executes, images/videos/text pageable together)
+- ✅ Single-file direct download (a one-file selection is no longer packaged, saving both the wait
+  and the temporary disk usage)
+- ✅ Faster packaging (already-compressed formats stored as-is + fastest deflate for the rest:
+  measured 160 MB / 220 files from 7.2 s to 0.7 s)
+- ✅ Real download progress (byte-accurate server counters polled by the page: packaging →
+  downloading x% → complete / interrupted)
 - ✅ Automatic self-signed HTTPS certificate generation (SANs for every LAN IPv4 / IPv6 address)

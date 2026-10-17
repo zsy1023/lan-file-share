@@ -339,8 +339,12 @@ function loadArchiver() {
  * 批量下载采用「先打包落盘、再按 Range 下发」的两段式,解决大包传一半断了要重来的问题:
  *
  *   1. POST /api/download-zip/prepare  → 服务端在系统临时目录生成 ZIP,返回一个 zipId
- *      (打包过程可查询进度;同一个选择重复请求会复用已完成的包)
+ *      (打包过程可查询进度;同一个选择重复请求会复用已完成的包;
+ *       压缩策略偏速度:已压缩格式 store,其余 deflate 最快档,见 ZIP_STORED_EXT)
  *   2. GET  /api/download-zip/get?id=… → 按普通文件那样支持 Range 断点续传、多线程下载
+ *      (逐字节统计已发送量,前端轮询 /status 的 xfer 显示真实下载进度)
+ *
+ * 另外:前端只勾了**一个文件**时根本不会调用这里的接口,而是直接下原文件。
  *
  * 为什么不在线边压边传:ZIP 的中央目录写在文件末尾,流式响应没法随机定位,
  * 一旦中断整个包就得从头再来。对动辄几十 GB 的共享目录,这在实际使用中不可接受。
@@ -429,6 +433,34 @@ function zipKeyOf(ctx, url, items) {
 }
 
 /**
+ * 打包时的压缩策略:局域网传输更看重「快」。
+ *   - 本身已是压缩格式的(jpg/png/mp4/zip/pdf/docx/apk…)再走 deflate 只是白烧 CPU,
+ *     体积几乎不会变小 → 直接「存储」(store),速度接近磁盘顺序读;
+ *   - 其余(文本 / 日志 / 数据库 / bmp / wav 等)用 deflate **最快档**(level 1):
+ *     比默认 level 6 快数倍,体积只大一点点。
+ * 效果:打包从「CPU 瓶颈」变成「磁盘瓶颈」,几十 GB 的相册/视频也能很快出包。
+ */
+const ZIP_STORED_EXT = new Set([
+  // 图片
+  '.jpg', '.jpeg', '.png', '.gif', '.webp', '.heic', '.heif', '.avif', '.jxl',
+  // 视频
+  '.mp4', '.m4v', '.mov', '.mkv', '.webm', '.avi', '.wmv', '.flv', '.mpg', '.mpeg',
+  '.ts', '.m2ts', '.3gp', '.rmvb', '.rm',
+  // 音频(除 wav 外基本都是压缩格式)
+  '.mp3', '.aac', '.m4a', '.flac', '.ogg', '.opus', '.wma',
+  // 压缩包 / 镜像 / 安装包
+  '.zip', '.7z', '.rar', '.gz', '.bz2', '.xz', '.zst', '.br', '.cab',
+  '.apk', '.jar', '.exe', '.dll', '.msi', '.iso', '.img', '.bin',
+  // 已是压缩容器的文档
+  '.pdf', '.docx', '.xlsx', '.pptx', '.odt', '.ods', '.odp',
+]);
+/** 给 archiver 的单个条目选项:已压缩格式不再二次压缩。 */
+function zipEntryOpts(absPath, name) {
+  const ext = path.extname(String(absPath || name || '')).toLowerCase();
+  return ZIP_STORED_EXT.has(ext) ? { name, store: true } : { name };
+}
+
+/**
  * 第一步:准备压缩包(落盘到系统临时目录)。
  * 立即返回 zipId;真正的打包在后台进行,前端可轮询进度。
  */
@@ -463,7 +495,7 @@ async function handleZipPrepare(ctx, req, res, url) {
   // 后台打包:先写临时文件,写完再原子改名,避免半成品被下载
   const part = file + '.part';
   const out = fs.createWriteStream(part);
-  const archive = lib.create({ zlib: { level: 6 } });
+  const archive = lib.create({ zlib: { level: 1 } });   // 速度优先(见 ZIP_STORED_EXT 的说明)
   archive.on('error', (e) => { entry.error = e.message; try { out.destroy(); } catch {} });
   out.on('error', (e) => { entry.error = e.message; });
   out.on('close', () => {
@@ -489,7 +521,7 @@ async function handleZipPrepare(ctx, req, res, url) {
       if (entry.error) break;
       try {
         if (it.isDir) entry.added += await addDirToArchive(archive, it.abs, it.zipRoot, entry);
-        else { archive.file(it.abs, { name: it.zipRoot }); entry.added++; entry.total++; }
+        else { archive.file(it.abs, zipEntryOpts(it.abs, it.zipRoot)); entry.added++; entry.total++; }
       } catch (e) {
         errorLine(`打包「${it.rel}」失败: ${e.message}`);
       }
@@ -505,13 +537,20 @@ async function handleZipPrepare(ctx, req, res, url) {
   return sendJson(res, 200, { ok: true, id, name: zipName, pending: true });
 }
 
-/** 查询打包进度。 */
+/** 查询打包进度(以及打包完成后「下载阶段」的真实传输进度)。 */
 function handleZipStatus(ctx, req, res, url) {
   const z = zips.get(String(url.searchParams.get('id') || ''));
   if (!z) return sendJson(res, 404, { ok: false, error: '打包任务不存在或已过期' });
+  const x = z.xfer;
+  const sent = x ? Math.min(x.sent, x.total) : 0;
   return sendJson(res, 200, {
     ok: true, id: z.id, ready: !!z.ready, error: z.error || '',
     name: z.name, size: z.size, added: z.added, items: z.items,
+    // xfer:本次下载的实时进度;还没开始下载时为 null
+    xfer: x ? {
+      total: x.total, sent, pct: x.total > 0 ? Math.min(100, Math.round(sent / x.total * 100)) : 0,
+      done: !!x.done, aborted: !!x.aborted, range: !!x.range, startedAt: x.started,
+    } : null,
   });
 }
 
@@ -538,7 +577,20 @@ async function handleZipGet(ctx, req, res, url) {
     'Cache-Control': 'no-store',
     'X-Content-Type-Options': 'nosniff',
   };
-  return sendFileByRange(req, res, z.file, st, head);
+  // 记录这次传输的进度,供前端轮询显示「真实下载进度」(它是逐字节累加,不是"点一下就算完成")
+  const xfer = { total: st.size, sent: 0, started: Date.now(), done: false, aborted: false,
+                 range: !!req.headers.range };
+  const r0 = parseRange(req.headers.range, st.size);
+  if (!r0.invalid && r0.start > 0) xfer.sent = r0.start;   // 续传:从断点处开始计
+  // HEAD 不发正文,不建进度记录(否则前端会一直看到 0% 的假进度)
+  if (req.method !== 'HEAD') z.xfer = xfer;
+  return sendFileByRange(req, res, z.file, st, head, {
+    onProgress: (n) => { xfer.sent += n; },
+    onDone: (aborted) => {
+      xfer.done = !aborted;
+      xfer.aborted = !!aborted;
+    },
+  });
 }
 
 /**
@@ -564,7 +616,7 @@ async function addDirToArchive(archive, dirAbs, zipRoot, entry) {
       if (st.isSymbolicLink()) continue;            // 不进链接,防越界
       if (st.isDirectory()) await walk(childAbs, childZip);
       else {
-        archive.file(childAbs, { name: childZip });
+        archive.file(childAbs, zipEntryOpts(childAbs, childZip));
         count++;
         if (entry) entry.total++;
       }
@@ -606,8 +658,10 @@ function parseRange(rangeHeader, size) {
 /**
  * 把本地文件按 Range 语义发给客户端(断点续传)。
  * 单文件下载与打包结果下载都走这里,保证行为一致。
+ * hooks(可选)= { onProgress(sentBytes), onDone(aborted) }:只有「打包结果下载」用它统计
+ * 真实传输进度,前端据此显示下载百分比(而不是点一下就算完成)。
  */
-function sendFileByRange(req, res, fileAbs, stat, head) {
+function sendFileByRange(req, res, fileAbs, stat, head, hooks) {
   const r = parseRange(req.headers.range, stat.size);
   if (r.invalid) {
     res.writeHead(416, { 'Content-Range': `bytes */${stat.size}` });
@@ -619,6 +673,13 @@ function sendFileByRange(req, res, fileAbs, stat, head) {
   res.writeHead(r.status, head);
   if (req.method === 'HEAD') return res.end();
   const f = fs.createReadStream(fileAbs, { start: r.start, end: r.end });
+  if (hooks) {
+    if (typeof hooks.onProgress === 'function') f.on('data', (c) => hooks.onProgress(c.length));
+    if (typeof hooks.onDone === 'function') {
+      f.on('end', () => hooks.onDone(false));                                  // 全部读完并写出去
+      res.on('close', () => { if (!res.writableFinished) hooks.onDone(true); }); // 客户端中途断开
+    }
+  }
   pipeline(f, res).catch(() => { f.destroy(); });
 }
 
@@ -2613,6 +2674,12 @@ const PAGE_HTML = `<!DOCTYPE html>
   /* 视频预览:用原生播放器,不参与图片缩放 */
   #lightbox video.lb-video { max-width:100%; max-height:100%; border-radius:8px; background:#000;
     box-shadow:0 10px 40px rgba(0,0,0,.55); outline:none; }
+  /* 文本预览:等宽字体 + 可滚动,长行自动换行(只读展示,不参与图片缩放) */
+  #lightbox pre.lb-text { margin:0; max-width:min(1100px, 92vw); max-height:calc(100vh - 150px);
+    overflow:auto; background:#0b1220; color:#e5e7eb; border:1px solid rgba(255,255,255,.14);
+    border-radius:10px; padding:16px 18px; font-family:ui-monospace, Consolas, "Courier New", monospace;
+    font-size:13px; line-height:1.55; white-space:pre-wrap; word-break:break-word;
+    box-shadow:0 10px 40px rgba(0,0,0,.55); }
   #lightbox .lb-spin { color:#cbd5e1; font-size:14px; z-index:2; }
   #lightbox .lb-note { position:absolute; top:14px; left:50%; transform:translateX(-50%); z-index:4;
     color:#fde68a; background:rgba(120,53,15,.82); border:1px solid rgba(253,230,138,.35); border-radius:8px;
@@ -2790,7 +2857,7 @@ const PAGE_HTML = `<!DOCTYPE html>
       <span>已选 <span class="cnt" id="selCount">0</span> 项</span>
       <button type="button" id="selAll">全选</button>
       <button type="button" id="selNone" disabled>清空</button>
-      <button type="button" id="selZip" class="primary" disabled title="把选中的文件/文件夹打包成 ZIP 下载">⬇ 下载选中</button>
+      <button type="button" id="selZip" class="primary" disabled title="只勾一个文件时直接下载原文件;勾多个(或文件夹)时打包成 ZIP 下载">⬇ 下载选中</button>
     </span>
   </div>
 
@@ -2954,13 +3021,7 @@ function renderPickedState(){
     cell.classList.toggle("picked", on);
   }
 }
-/**
- * 打包下载选中项(两段式):
- *   1. 先请服务端打包(大目录可能耗时几十秒),期间显示进度;
- *   2. 打完再触发浏览器下载 —— 此时走的是一个普通文件 URL,支持 Range 断点续传,
- *      所以断网/暂停后可以接着下,不会整包重来。
- */
-/* ---------- 打包下载的进度提示 ---------- */
+/* ---------- 下载进度提示 ---------- */
 // 打包大目录可能要很久,必须给出明确反馈,否则用户以为卡死了会重复点。
 function pkgHide(delay){
   const box = $("pkgBox");
@@ -2977,14 +3038,23 @@ function pkgSet(pct, text, cls){
 }
 
 /**
- * 打包下载选中项(两段式):
- *   1. 先请服务端打包(大目录可能耗时很久),期间显示进度;
- *   2. 打完再触发浏览器下载 —— 此时走的是一个普通文件 URL,支持 Range 断点续传,
- *      所以断网/暂停后可以接着下,不会整包重来。
+ * 「下载选中」:
+ *   0. 只勾了一个**文件** → 不打包,直接下载原文件(最快,也不占临时空间);
+ *   1. 否则请服务端打包(大目录可能耗时,期间显示打包进度);
+ *   2. 打完触发浏览器下载,并继续轮询**真实传输进度**(已下载/总计),
+ *      下完了才显示完成 —— 而不是点一下就当成功。
  */
 async function downloadPicked(){
   if(!picked.size){ msg("请先勾选要下载的文件或文件夹", true); return; }
   const list = [...picked];
+
+  // 只勾了一个文件:直接下原文件。打包对单个文件毫无意义(既慢又要占临时磁盘)
+  if(list.length === 1){
+    const rel = list[0];
+    const ent = lastEntries.find(x=>!x.isDir && ((cur ? cur+"/"+x.name : x.name) === rel));
+    if(ent){ startDirectDownload(rel, ent.name); return; }
+  }
+
   const btn = $("selZip");
   if(btn){ btn.disabled = true; }
   msg("");
@@ -3017,21 +3087,90 @@ async function downloadPicked(){
 
     // 打包完成:用隐藏 iframe 触发下载(不离开当前页,也不会被当成弹窗拦截)。
     // 这个 URL 支持 Range,浏览器下载管理器里可以暂停/继续。
-    pkgSet(100, "打包完成,正在开始下载:"+ (j.name || "压缩包"), "ok");
     const url = "/api/download-zip/get?id="+enc(id);
     const fr = document.createElement("iframe");
     fr.style.display = "none";
     fr.src = url;
     document.body.appendChild(fr);
     setTimeout(()=>fr.remove(), 30*60*1000);
-    msg("已开始下载:"+ (j.name || "压缩包") + "(若中断可在浏览器下载列表里继续)");
-    pkgHide(4000);
+    pkgSet(100, "打包完成,开始下载:"+ (j.name || "压缩包"), "ok");
+    msg("正在下载:"+ (j.name || "压缩包") + "(浏览器下载管理器里可暂停/续传)");
+    pollZipTransfer(id, j.name || "压缩包");   // 不 await:让进度条跟着真实传输量走
   }catch(e){
     pkgSet(100, "打包失败: "+e.message, "err");
     msg("打包失败: "+e.message, true);
     pkgHide(6000);
   }finally{
     if(btn){ btn.disabled = picked.size === 0; }
+  }
+}
+
+/** 单个文件直接下载(不打包)。下载进度由浏览器自带的下拉列表显示。 */
+function startDirectDownload(rel, name){
+  pkgPollSeq++;    // 停掉可能还在跑的「压缩包下载进度」轮询,免得它把这里的提示覆盖掉
+  const fr = document.createElement("iframe");
+  fr.style.display = "none";
+  fr.src = "/download"+qs(rel);
+  document.body.appendChild(fr);
+  setTimeout(()=>fr.remove(), 5*60*1000);
+  pkgSet(100, "正在下载:"+name+"(单个文件直接下载,不打包)", "ok");
+  msg("正在下载:"+name+"(单个文件直接下载,不需要打包)");
+  pkgHide(3500);
+}
+
+/**
+ * 打包完成后,轮询服务端「本次下载已发出的字节数」并实时显示。
+ * 服务端在 /api/download-zip/status 里返回 xfer = { sent, total, pct, done, aborted }。
+ * 这样「下载完成」只会在真的传完之后出现,中途中断也能立刻看到。
+ */
+let pkgPollSeq = 0;   // 只让「最新一次下载」的轮询更新界面,避免旧任务把新进度覆盖掉
+async function pollZipTransfer(id, name){
+  const me = ++pkgPollSeq;
+  const t0 = Date.now();
+  let idle = 0;
+  for(;;){
+    await new Promise(r=>setTimeout(r, 500));
+    if(me !== pkgPollSeq) return;
+    let sj;
+    try{
+      const sr = await fetch("/api/download-zip/status?id="+enc(id));
+      if(!sr.ok) throw new Error("HTTP "+sr.status);
+      sj = await sr.json();
+    }catch(e){
+      if(me !== pkgPollSeq) return;
+      pkgSet(100, "拿不到下载进度(与服务器的连接中断了):"+e.message, "err");
+      pkgHide(8000);
+      return;
+    }
+    if(me !== pkgPollSeq) return;
+    if(sj.error){ pkgSet(100, "打包/下载出错: "+sj.error, "err"); pkgHide(8000); return; }
+
+    const x = sj.xfer;
+    if(!x){
+      // 浏览器还没真正发出下载请求(有时会被下载设置/拦截器卡一下)
+      idle++;
+      if(idle > 20){
+        pkgSet(100, "没检测到下载进度(浏览器可能取消了下载),可重新点一次下载", "err");
+        pkgHide(8000);
+        return;
+      }
+      pkgSet(100, "等待浏览器开始下载…", "ok");
+      continue;
+    }
+    if(x.done){
+      pkgSet(100, "下载完成:"+name+"("+fmtSize(x.total)+")", "ok");
+      msg("下载完成:"+name+"("+fmtSize(x.total)+")");
+      pkgHide(4000);
+      return;
+    }
+    if(x.aborted){
+      pkgSet(100, "下载中断:"+name+"(已传 "+fmtSize(x.sent)+" / "+fmtSize(x.total)+"),重新点击可续传", "err");
+      pkgHide(9000);
+      return;
+    }
+    const slow = (Date.now()-t0) > 60000 ? " · 浏览器下载管理器里可暂停/续传" : "";
+    pkgSet(Math.min(99, x.pct || 0),
+      "正在下载… "+fmtSize(x.sent)+" / "+fmtSize(x.total)+" ("+(x.pct||0)+"%)"+slow, "ok");
   }
 }
 
@@ -3174,6 +3313,12 @@ function render(j){
       im.src="/thumb"+qs(full);
       im.addEventListener("click",(ev)=>{ ev.preventDefault(); ev.stopPropagation(); openLightbox(full,e.name); });
       td1.appendChild(im);
+    } else if(!e.isDir && isTextName(e.name)){
+      // 文本类:图标本身可点,点了直接在预览层里看内容
+      const ic=document.createElement("span");
+      ic.textContent="📄"; ic.style.cursor="zoom-in"; ic.title="点击预览文本内容";
+      ic.addEventListener("click",(ev)=>{ ev.preventDefault(); ev.stopPropagation(); openLightbox(full,e.name); });
+      td1.appendChild(ic);
     } else {
       td1.textContent = e.isDir ? "📁" : "📄";
     }
@@ -3192,7 +3337,13 @@ function render(j){
     if(!e.isDir){
       const dv=document.createElement("a"); dv.href="/download"+qs(full); dv.textContent="下载";
       td5.appendChild(dv);
-      // 列表里不再放「预览」按钮:图片点缩略图放大,其它类型可在名称处查看
+      // 图片/视频点缩略图查看;文本类没缩略图,给一个明确的「预览」入口
+      if(isTextName(e.name)){
+        const pv=document.createElement("button"); pv.textContent="预览";
+        pv.title="在页面里直接看文本内容(不必先下载)";
+        pv.addEventListener("click",(ev)=>{ ev.stopPropagation(); openLightbox(full,e.name); });
+        td5.appendChild(pv);
+      }
     }
     // 重命名 / 删除(只读口令下不显示;服务端也会拒绝)
     if(!READONLY){
@@ -3255,6 +3406,12 @@ function render(j){
       });
       im.src="/thumb"+qs(full);
       thumb.appendChild(im);
+      thumb.addEventListener("click",()=>openLightbox(full,e.name));
+    } else if(isTextName(e.name)){
+      // 文本类:点格子直接预览内容(不必先下载)
+      const ph=document.createElement("span"); ph.className="ph"; ph.textContent="📄";
+      ph.title="点击预览文本内容"; ph.style.cursor="zoom-in";
+      thumb.appendChild(ph);
       thumb.addEventListener("click",()=>openLightbox(full,e.name));
     } else {
       const ph=document.createElement("span"); ph.className="ph"; ph.textContent=isInlineable(e.name)?"📄":"📦";
@@ -3583,6 +3740,57 @@ function isVideoName(n){
 }
 /** 有封面可看(缩略图/视频封面)的条目。 */
 function hasCover(n){ return isImageName(n) || isVideoName(n); }
+
+/* ---------- 文本类文件:直接在预览层里看内容(txt / 日志 / 配置 / 代码等) ---------- */
+const TEXT_PREVIEW_MAX = 1024 * 1024;   // 最多预览前 1 MB,避免超大日志把页面卡死
+const TEXT_EXTS = ["txt","text","log","md","markdown","json","csv","tsv","xml","yml","yaml",
+  "ini","conf","cfg","toml","sql","js","mjs","cjs","jsx","ts","tsx","css","scss","less",
+  "html","htm","bat","cmd","ps1","sh","bash","py","java","c","h","cpp","cs","go","rs","php","rb",
+  "properties","env","list","diff","patch","srt","vtt","nfo"];
+function isTextName(n){
+  const s=String(n||"");
+  // 无扩展名的常见文本文件也算(README / LICENSE / Dockerfile / .gitignore 等)
+  if(/^(readme|license|licence|changelog|makefile|dockerfile|hosts|\.gitignore|\.gitattributes|\.env)$/i.test(s)) return true;
+  const ext=(s.match(/\\.([^.]+)$/)||[])[1]||"";
+  return TEXT_EXTS.includes(ext.toLowerCase());
+}
+/** 预览层里的缩放按钮对文本/视频没意义,按种类显示或隐藏。 */
+function setZoomCtl(show){
+  for(const id of ["lbZoomOut","lbZoomIn","lbZoomReset","lbZoomLvl"]){
+    const el=$(id); if(el) el.style.display = show ? "" : "none";
+  }
+}
+/**
+ * 读取文本文件并显示在预览层里。
+ * 只取前 1MB(Range),优先按 UTF-8 解码;失败再退回 GB18030
+ * (中文 Windows 用记事本存的 txt 多半是 GBK/GB18030,按 UTF-8 读会是乱码)。
+ */
+async function loadTextInto(rel, pre){
+  try{
+    const r = await fetch("/raw"+qs(rel)+"&inline=1", { headers: { "Range": "bytes=0-"+(TEXT_PREVIEW_MAX-1) } });
+    if(!r.ok) throw new Error("HTTP "+r.status);
+    const cr = r.headers.get("content-range") || "";
+    const mt = /\\/(\\d+)\\s*$/.exec(cr);
+    const totalSize = mt ? Number(mt[1]) : null;
+    const buf = await r.arrayBuffer();
+    let text;
+    try{ text = new TextDecoder("utf-8", { fatal: true }).decode(buf); }
+    catch(e1){
+      try{ text = new TextDecoder("gb18030").decode(buf); }
+      catch(e2){ text = new TextDecoder("utf-8").decode(buf); }
+    }
+    pre.textContent = text.length ? text : "(空文件)";
+    if(totalSize && totalSize > TEXT_PREVIEW_MAX){
+      const note=$("lbNote");
+      if(note){
+        note.textContent = "文件较大("+fmtSize(totalSize)+"),这里只预览前 1 MB;需要全文请点「下载」";
+        note.className = "lb-note warn";
+      }
+    }
+  }catch(e){
+    pre.textContent = "读取失败: "+e.message;
+  }
+}
 function applyView(){
   document.body.classList.remove("view-list","view-icons","view-tiles","view-thumbs");
   document.body.classList.add("view-"+viewMode);
@@ -3627,9 +3835,10 @@ let lbList=[], lbIndex=-1;
 // 必须在使用它们的函数之前声明。
 let lbZoom=1, lbPanX=0, lbPanY=0;
 function lbImagesInDir(){
-  // 当前目录里"可预览"的条目(图片 + 视频),用于左右切换
-  return lastEntries.filter(e=>!e.isDir && hasCover(e.name))
-    .map(e=>({ name:e.name, rel: cur ? cur+"/"+e.name : e.name, video: isVideoName(e.name) }));
+  // 当前目录里"可预览"的条目(图片 + 视频 + 文本),用于左右切换
+  return lastEntries.filter(e=>!e.isDir && (hasCover(e.name) || isTextName(e.name)))
+    .map(e=>({ name:e.name, rel: cur ? cur+"/"+e.name : e.name,
+               video: isVideoName(e.name), text: !hasCover(e.name) && isTextName(e.name) }));
 }
 function openLightbox(rel, name){
   lbList = lbImagesInDir();
@@ -3679,6 +3888,26 @@ function showLightbox(){
   const stage=$("lbStage");
   stage.textContent="";
 
+  // ---------- 文本:等宽只读展示,不参与缩放 ----------
+  if(it.text){
+    const pre=document.createElement("pre");
+    pre.className="lb-text"; pre.textContent="正在读取…";
+    stage.appendChild(pre);
+    const note=$("lbNote");
+    if(note){ note.textContent=""; note.className="lb-note"; }
+    $("lbName").textContent = it.name;
+    $("lbIdx").textContent = lbList.length>1 ? ((lbIndex+1)+" / "+lbList.length) : "";
+    $("lbOpen").href = "/raw"+qs(it.rel)+"&inline=1";
+    $("lbDown").href = "/download"+qs(it.rel);
+    const hasPrev=lbList.length>1, hasNext=lbList.length>1;
+    $("lbPrev").disabled=!hasPrev; $("lbNext").disabled=!hasNext;
+    $("lbPrev").style.display = hasPrev ? "" : "none";
+    $("lbNext").style.display = hasNext ? "" : "none";
+    setZoomCtl(false);
+    loadTextInto(it.rel, pre);
+    return;
+  }
+
   // ---------- 视频:用播放器而不是图片缩放的交互 ----------
   if(it.video){
     const src = "/raw"+qs(it.rel)+"&inline=1";
@@ -3702,10 +3931,12 @@ function showLightbox(){
     $("lbPrev").disabled=!hasPrev; $("lbNext").disabled=!hasNext;
     $("lbPrev").style.display = hasPrev ? "" : "none";
     $("lbNext").style.display = hasNext ? "" : "none";
+    setZoomCtl(false);
     resetZoom(null);
     return;
   }
 
+  setZoomCtl(true);
   const spin=document.createElement("div"); spin.className="lb-spin"; spin.textContent="加载中…";
   stage.appendChild(spin);
 
