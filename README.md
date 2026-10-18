@@ -33,6 +33,7 @@
 lan-file-share/
 ├─ server.js        # HTTPS 服务器主程序(浏览+下载+上传+实时同步+单独分享+访问密码+操作日志)
 ├─ gen-cert.js      # 生成自签名 HTTPS 证书(含本机各局域网 IPv4 / IPv6 地址的 SAN)
+├─ gen-csr.js       # 想用免费 CA(Let's Encrypt / ZeroSSL 等)时:生成新私钥 + CSR
 ├─ start.bat        # 【推荐】Windows 一键启动(缺证书会自动先生成)
 ├─ setup.bat        # 【推荐】Windows 一键安装(装依赖 + 生成证书 + 启动)
 ├─ setup.sh         # Linux / macOS 一键安装(同上流程)
@@ -181,6 +182,35 @@ node server.js
 > 说明:证书里已自动包含本机在局域网内的 **IPv4 与 IPv6 地址**以及 `localhost`
 > (生成时实时扫描网卡),一般无需手动改;若后来又换网段,请删除 `certs/*` 后重新运行
 > `node gen-cert.js` 或再次运行 `start.bat` / `setup.sh`。
+
+### 方式 C —— 有域名时用免费 CA 签(可选)
+
+如果你有域名(或免费 DDNS),可以改用 Let's Encrypt / ZeroSSL / FreeSSL 这类免费 CA,
+好处是**任何设备都不用装证书**(公共 CA 已受信任)。但要先接受三个前提:
+
+1. **免费 CA 只签域名,不签内网 IP** —— 证书里只会包含你验证过的域名;
+2. **验证只能走 DNS-01** —— 域名指向内网地址时,CA 访问不到你的机器,必须加一条
+   `_acme-challenge.<域名>` 的 **TXT** 记录;
+3. **客户端必须用域名访问**,并让这个域名解析到服务器的内网 IP(hosts 文件 / 路由器 DNS 重写 / 本地 DNS),
+   否则浏览器仍按 IP 校验,照样报「名称不匹配」。
+
+流程:
+
+```bash
+node gen-csr.js files.example.com      # 生成 certs/files.example.com.key 与 .csr
+                                       # (不会覆盖你现在能用的 server.key)
+# 再把 .csr 的内容粘到 CA 的申请页 → 按提示做 DNS-01 → 下载签好的证书
+```
+
+拿到证书后:
+
+1. 把 CA 返回的证书存成 `certs/server.crt`(若同时给了中间证书 chain,接在同一个文件后面);
+2. 让服务用新私钥:把 `certs/files.example.com.key` 改名成 `server.key`,或改 `config.json` 的 `keyFile`;
+3. 重启服务。
+
+> **续期**:免费证书 90 天。有 DNS API 的话可以用 `acme.sh --dns` 全自动续期,
+> 续期后把证书写到 `certs/server.crt` 再重启服务即可;没有自动化就得每 90 天手动来一次。
+> 局域网内长期使用,「方式 B(自签 + 装信任库)」其实更省事——一次装好、两年不用管。
 
 ---
 

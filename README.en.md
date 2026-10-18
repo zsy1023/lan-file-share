@@ -39,6 +39,7 @@ Project files:
 lan-file-share/
 ├─ server.js        # HTTPS server (browse + download + upload + live sync + per-folder share + access password + action log)
 ├─ gen-cert.js      # Generates the self-signed HTTPS cert (with SANs for every LAN IPv4 / IPv6 address)
+├─ gen-csr.js       # For a free CA (Let's Encrypt / ZeroSSL …): generates a new key + CSR
 ├─ start.bat        # [Recommended] one-click start on Windows (auto-generates the cert if missing)
 ├─ setup.bat        # [Recommended] one-click setup on Windows (deps + cert + start)
 ├─ setup.sh         # One-click setup for Linux / macOS (same steps)
@@ -217,6 +218,41 @@ Copy `certs/server.crt` from the computer to each device and install it as a
 > addresses plus `localhost` (NICs are scanned in real time during generation), so you
 > normally don't need to edit anything. If you later change subnets, delete `certs/*`
 > and run `node gen-cert.js` again or rerun `start.bat` / `setup.sh`.
+
+### Option C — use a free CA when you own a domain (optional)
+
+If you have a domain (or a free DDNS name) you can switch to a free CA such as
+Let's Encrypt / ZeroSSL / FreeSSL; the upside is that **no device has to install
+anything** (public CAs are already trusted). Three preconditions:
+
+1. **Free CAs only sign domains, not private IPs** — the certificate contains just the
+   name you validated;
+2. **Validation has to be DNS-01** — when the name points at a private address the CA
+   cannot reach your machine, so you must add a `_acme-challenge.<domain>` **TXT** record;
+3. **Clients must browse by name**, and that name has to resolve to the server's LAN IP
+   (hosts file / router DNS rewrite / local DNS), otherwise browsers still validate
+   against the IP and report a name mismatch.
+
+Flow:
+
+```bash
+node gen-csr.js files.example.com      # writes certs/files.example.com.key and .csr
+                                       # (never touches your working server.key)
+# paste the .csr into the CA's form → do the DNS-01 step → download the signed cert
+```
+
+After you get it:
+
+1. save the returned certificate as `certs/server.crt` (append the intermediate chain to
+   the same file if the CA provides one);
+2. switch to the new key: rename `certs/files.example.com.key` to `server.key`, or point
+   `config.json`'s `keyFile` at it;
+3. restart the server.
+
+> **Renewal**: free certificates last 90 days. With a DNS API you can automate it with
+> `acme.sh --dns` and write the renewed cert to `certs/server.crt` before restarting;
+> without automation it is a manual 90-day chore. For pure LAN use, option B
+> (self-signed + trust store) is less work — install once, good for two years.
 
 ---
 
