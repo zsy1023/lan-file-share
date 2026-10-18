@@ -321,6 +321,8 @@ Expose one subfolder on its own port — ideal for "give just this folder to a f
   shares, copies URLs, **changes the read-write / read-only passwords separately**,
   changes the port, and **cancels a share** (cancelling only closes that port; files
   are not deleted).
+- **Log out**: after entering such a port with a password, the same **"🚪 退出登录"**
+  button appears in the top-right and clears the password the browser saved.
 - **Survives restarts**: share records are stored in `shares.json` next to the
   program (password hashes only, never plaintext) and restored on restart. If a
   directory was deleted or a port is taken, that one entry is skipped with a notice
@@ -360,6 +362,12 @@ directly, put a password in front of the **main share**.
   the LAN logs `[DENY] … 根目录访问密码错误或未提供` (denied: root access password
   missing or wrong), and on success the log's "where" field reads
   `主共享:8443(凭访问密码)` so you can tell local access from LAN access with the password.
+- **Log out**: once you are in with a password, a **"🚪 退出登录"** button appears in the
+  top-right (it is not shown for password-free local access). Clicking it clears the
+  credential the browser remembers: the server answers with a 401 challenge, so the
+  browser drops the cached password and the next visit asks again. **Note:** click
+  "Cancel" in the dialog to actually log out — typing the password again just logs you
+  back in. Share ports show the same button when you entered them with a password.
 
 > This is a latch for a **trusted LAN**, **not an account system**: one password for
 > the whole site, no users and no per-user permissions, and no "read-only" mode —
@@ -670,6 +678,9 @@ npm start                   # start
 - ✅ Root access password (set from the local web UI, effective immediately, scrypt hash only in
   `rootauth.json`, LAN 401 challenge / local machine exempt / per-IP failure throttle 429 /
   live-sync connections dropped the moment it changes)
+- ✅ Log out (shown only when you got in with a password; `/logout` answers 401 so the browser
+  drops the cached credential, repeated hits from one IP are challenged only once every 20 s to
+  avoid a dialog loop, and read-only passwords can log out too)
 - ✅ Text preview (txt / logs / configs / code, read-only, first 1 MB only, UTF-8 → GB18030
   fallback, rendered via `textContent` so nothing executes, images/videos/text pageable together)
 - ✅ Single-file direct download (a one-file selection is no longer packaged, saving both the wait

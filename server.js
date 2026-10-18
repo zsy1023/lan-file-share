@@ -1190,6 +1190,7 @@ const LOG_LABEL = {
   shareWebdav: 'WebDAV 开关',
   sharePick: '选择本机文件夹',
   rootPwd: '修改访问密码',
+  logout: '退出登录',
   deny: '拒绝访问', error: '服务异常',
 };
 // 这些动作属于“写操作”,在 quiet 级别也记录
@@ -1915,6 +1916,7 @@ const READONLY_ALLOWED = new Set([
   '/api/download-zip/status', // 批量下载的进度查询
   '/raw',                     // 预览原图
   '/thumb',                   // 低清预览图
+  '/logout',                  // 退出登录(只读口令的用户也该能退出去)
 ]);
 // 这些接口虽是 POST(要带选中列表,放在 body 更省长度),但并不写共享目录,
 // 因此对只读用户也放行 —— 批量下载本就是读操作。
@@ -2490,11 +2492,14 @@ function renderPage(ctx) {
   const isMain = ctx.kind === 'main' ? 'true' : 'false';
   // 只读口令进来时,前端隐藏所有写操作入口(服务端也会再拦一次)
   const readonly = (ctx.kind === 'share' && ctx.role === 'ro') ? 'true' : 'false';
+  // 只有“这次访问确实凭口令进来”时才显示「退出登录」(本机免密访问时退出没有意义)
+  const hasAuth = ctx.authUsed ? 'true' : 'false';
   const page = PAGE_HTML
     .replace(/__TITLE__/g, title)
     .replace(/__CAN_SHARE__/g, canShare)
     .replace(/__IS_MAIN__/g, isMain)
-    .replace(/__READONLY__/g, readonly);
+    .replace(/__READONLY__/g, readonly)
+    .replace(/__HAS_AUTH__/g, hasAuth);
   return page;
 }
 
@@ -2716,6 +2721,7 @@ const PAGE_HTML = `<!DOCTYPE html>
   .btn-sm { display:inline-flex; align-items:center; gap:6px; background:var(--card,#fff); color:var(--accent,#2563eb);
     border:1px solid #bcd3ff; border-radius:8px; padding:6px 12px; font-size:13px; cursor:pointer; white-space:nowrap; }
   .btn-sm:hover { background:#f3f7ff; }
+  a.btn-sm { text-decoration:none; }   /* 「退出登录」是个链接,去掉下划线看起来才像按钮 */
   .btn-sm .cnt { background:#2563eb; color:#fff; border-radius:9px; font-size:11px; line-height:1; padding:3px 6px; }
   .btn-sm[disabled] { opacity:.45; cursor:not-allowed; }
   #sharePanel { display:none; }
@@ -2780,6 +2786,9 @@ const PAGE_HTML = `<!DOCTYPE html>
     <button class="btn-sm" id="btnSharePanel" type="button" title="查看与管理已单独分享的文件夹">🔗 单独分享 <span class="cnt" id="shareCnt" style="display:none">0</span></button>
     <button class="btn-sm" id="btnPwdPanel" type="button" title="设置局域网访问本共享根所需的密码">🔒 访问密码</button>
     <button class="btn-sm" id="btnLog" type="button" title="查看最近的操作日志">📋 操作日志</button>
+  </span>
+  <span class="hdr-actions" id="authBox" style="display:none">
+    <a class="btn-sm" id="btnLogout" href="/logout" title="退出登录:清掉浏览器记住的口令,下次访问需要重新输入">🚪 退出登录</a>
   </span>
   <span id="headerPath" style="color:var(--mut);font-size:13px"></span>
 </header>
@@ -2975,6 +2984,7 @@ let cellSize = 132;    // 网格视图的单元格最小宽度(像素)
 const CAN_SHARE = __CAN_SHARE__;
 const IS_MAIN = __IS_MAIN__;
 const READONLY = __READONLY__;   // 用只读口令访问:隐藏所有写操作入口
+const HAS_AUTH = __HAS_AUTH__;   // 本次访问是凭口令进来的:显示「退出登录」
 let sharesCache = [];  // 当前已单独分享的文件夹列表
 let picked = new Set(); // 批量下载:已勾选的条目(当前目录内的相对路径)
 
@@ -4522,6 +4532,13 @@ async function submitPwd(clear){
     btn.disabled = false;
   }
 }
+/* ---------- 退出登录(仅当本次访问是凭口令进来时显示) ---------- */
+// 链接本身指向 /logout,由服务端回 401 让浏览器丢掉已缓存的口令,不需要前端做额外动作。
+function initAuthUi(){
+  if(!HAS_AUTH) return;
+  const box=$("authBox"); if(box) box.style.display="";
+}
+
 function initPwdUi(){
   if(!CAN_SHARE) return;                       // 单独分享端口:不显示管理入口
   $("btnPwdPanel").addEventListener("click", async ()=>{
@@ -4592,6 +4609,7 @@ initReadonly();
 initBulkDownload();
 initShareUi();
 initPwdUi();
+initAuthUi();
 </script>
 </body>
 </html>`;
@@ -4830,6 +4848,51 @@ async function handleShareApi(ctx, req, res, url) {
   throw new HttpError(404, '接口不存在');
 }
 
+/* ---- 退出登录 ---- */
+
+/**
+ * HTTP Basic 没有真正的「登录态」——浏览器只是把口令缓存在本站名下。
+ * 唯一可靠的做法是回一个 401 + WWW-Authenticate:浏览器收到后会丢弃已缓存的口令
+ * 并重新弹出输入框(在弹窗里点「取消」就等于退出)。
+ * 为免出现“输对口令 → 又被要求输”的死循环:同一 IP 在 LOGOUT_CHALLENGE_GAP 内的
+ * 重复请求只挑战一次,之后直接给说明页。
+ */
+const LOGOUT_CHALLENGE_GAP = 20_000;
+const logoutChallenged = new Map();   // ip -> 上次挑战时间
+function shouldChallengeLogout(ip) {
+  const now = Date.now();
+  const prev = logoutChallenged.get(ip) || 0;
+  logoutChallenged.set(ip, now);
+  if (logoutChallenged.size > 500) {                  // 防止无限增长
+    for (const [k, v] of logoutChallenged) if (now - v > 60_000) logoutChallenged.delete(k);
+  }
+  return now - prev > LOGOUT_CHALLENGE_GAP;
+}
+
+const LOGOUT_PAGE = `<!DOCTYPE html>
+<html lang="zh-CN"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>已退出登录</title>
+<style>
+  body { margin:0; min-height:100vh; display:flex; align-items:center; justify-content:center;
+         background:#f6f7f9; color:#1f2328; font-family:system-ui,"Segoe UI","Microsoft YaHei",sans-serif; }
+  .card { max-width:460px; margin:20px; padding:28px 26px; background:#fff; border:1px solid #e2e5ea;
+          border-radius:14px; box-shadow:0 12px 32px rgba(0,0,0,.08); text-align:center; }
+  h1 { font-size:18px; margin:0 0 10px; }
+  p { font-size:14px; line-height:1.75; color:#4b5563; margin:0 0 16px; }
+  .tip { color:#6b7280; font-size:13px; }
+  a { display:inline-block; background:#2563eb; color:#fff; text-decoration:none; border-radius:8px;
+      padding:9px 18px; font-size:14px; }
+</style></head>
+<body>
+  <div class="card">
+    <h1>🚪 已退出登录</h1>
+    <p>浏览器记住的口令已清除,下次访问需要重新输入。</p>
+    <p class="tip">若刚才的登录弹窗里又输入了口令,则仍处于登录状态;想彻底退出,请在弹窗里点「取消」,或关闭浏览器。</p>
+    <a href="/">重新进入</a>
+  </div>
+</body></html>`;
+
 /* ---------------- 路由 ---------------- */
 
 async function handleRequest(ctx, req, res) {
@@ -4843,6 +4906,7 @@ async function handleRequest(ctx, req, res) {
     if (!role) return;
     ctx.role = role.level;
     ctx.viaRootPwd = true;   // 供日志区分“本机直连”与“局域网凭密码进入”
+    ctx.authUsed = true;     // 页面据此显示「退出登录」
   }
 
   // 单独分享端口的口令校验(未设口令则直接放行)
@@ -4859,6 +4923,7 @@ async function handleRequest(ctx, req, res) {
       // 命中只读口令:整个请求期间 ctx.role='ro',下面会拦掉所有写操作
       ctx.role = role.level;
       ctx.viaRoPwd = role.level === 'ro';
+      ctx.authUsed = true;   // 页面据此显示「退出登录」
     } else {
       ctx.role = 'rw';   // 未设任何口令
     }
@@ -4880,6 +4945,21 @@ async function handleRequest(ctx, req, res) {
       logAction({ action: 'browse', ctx, req, path: '', ok: true });
       res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8', 'Cache-Control': 'no-store' });
       return res.end(renderPage(ctx));
+    }
+    // 退出登录:回 401 让浏览器丢掉缓存的口令(限流见 shouldChallengeLogout)
+    if (req.method === 'GET' && p === '/logout') {
+      logAction({ action: 'logout', ctx, req, ok: true,
+                  detail: ctx.authUsed ? '已退出登录' : '退出登录(本次访问本来就免密)' });
+      if (ctx.authUsed && shouldChallengeLogout(clientIP(req))) {
+        res.writeHead(401, {
+          'WWW-Authenticate': 'Basic realm="lan-file-share", charset="UTF-8"',
+          'Content-Type': 'text/html; charset=utf-8',
+          'Cache-Control': 'no-store',
+        });
+        return res.end(LOGOUT_PAGE);
+      }
+      res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8', 'Cache-Control': 'no-store' });
+      return res.end(LOGOUT_PAGE);
     }
     if (req.method === 'GET' && p === '/api/list') {
       const data = await listDir(ctx, url.searchParams.get('path') || '');
