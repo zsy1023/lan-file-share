@@ -115,6 +115,32 @@ Double-click **`setup.bat`** (Windows) or run **`./setup.sh`** in a terminal
 > section 4); if a **root access password** is set, it also asks for a username /
 > password first (username is irrelevant, only the password matters — see section 7).
 
+### Linux / macOS notes
+
+It runs **fully** on Linux (the whole thing is one Node script with no Windows-only
+dependency), but a few things differ from Windows:
+
+```bash
+git clone https://github.com/zsy1023/lan-file-share.git
+cd lan-file-share
+./setup.sh          # the executable bit is recorded in the repo; on an older clone use
+                    # bash setup.sh  (or chmod +x setup.sh)
+
+# just start the server, skipping the one-click install:
+node server.js
+```
+
+| Point | Notes |
+|---|---|
+| **Node version** | **Node 20 / 22 LTS** recommended. Recursive directory watching (live silent sync) on Linux needs Node ≥ 19.1; on Node 18 startup prints "the current filesystem does not support recursive watching" and only writes made by this service sync live — everything else still works |
+| **OpenSSL** | `gen-cert.js` uses `openssl req -addext`, so **OpenSSL ≥ 1.1.1** is required (Ubuntu 20.04+ / Debian 11+ / RHEL 8+ ship it; CentOS 7's 1.0.2 fails) |
+| **Firewall** | `sudo ufw allow 8443/tcp` (Fedora: `sudo firewall-cmd --add-port=8443/tcp --permanent && sudo firewall-cmd --reload`). **Individual share ports** (starting at 9000 by default) need allowing too |
+| **Certificate trust** | See the Linux commands under section 4 "Option B" (`update-ca-certificates` on Debian/Ubuntu, `update-ca-trust` on Fedora/RHEL); Chrome / Firefox may keep their own stores |
+| **Low ports** | `port` < 1024 needs root or `setcap`; the default 8443 is unaffected |
+| **Running in background** | `setup.sh` runs in the foreground; to keep it running use `nohup node server.js > log.txt 2>&1 &`, `screen` / `tmux`, or write your own systemd unit |
+| **Windows-only feature** | The "📂 分享本机其他文件夹…" button in the share panel uses the native Windows folder picker; on Linux it reports a failure and you type the absolute path instead (the feature itself still works) |
+| **Filename difference** | Linux allows `\` inside filenames, but the server normalises `\` to `/` as a path separator, so such files may not open in the web UI (very rare) |
+
 ---
 
 ## 3. How devices on the LAN use it
@@ -174,11 +200,23 @@ Copy `certs/server.crt` from the computer to each device and install it as a
   "Settings - General - About - Certificate Trust Settings".
 - **macOS**: double-click `server.crt` → Keychain Access → mark the certificate as
   "Always Trust".
+- **Linux** (install into the system trust store):
+  ```bash
+  # Debian / Ubuntu
+  sudo cp certs/server.crt /usr/local/share/ca-certificates/lan-file-share.crt
+  sudo update-ca-certificates
 
-> Note: the certificate automatically includes the machine's LAN IPv4 addresses and
-> `localhost` (NICs are scanned in real time during generation), so you normally
-> don't need to edit anything. If you later change subnets, delete `certs/*` and run
-> `node gen-cert.js` again or rerun `start.bat`.
+  # Fedora / RHEL / CentOS
+  sudo cp certs/server.crt /etc/pki/ca-trust/source/anchors/lan-file-share.crt
+  sudo update-ca-trust
+  ```
+  Browsers may keep their own store: Firefox needs the certificate imported once via
+  "Settings → Privacy & Security → Certificates → View Certificates → Authorities → Import".
+
+> Note: the certificate automatically includes the machine's LAN **IPv4 and IPv6**
+> addresses plus `localhost` (NICs are scanned in real time during generation), so you
+> normally don't need to edit anything. If you later change subnets, delete `certs/*`
+> and run `node gen-cert.js` again or rerun `start.bat` / `setup.sh`.
 
 ---
 

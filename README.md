@@ -5,7 +5,6 @@
 一个**开箱即用**的 Node.js 程序:把你电脑上的一个文件夹以 HTTPS 方式共享出来,局域网内的
 手机 / 平板 / 其它电脑用浏览器打开一个网址,就能浏览目录结构并**下载 / 上传**文件。
 
-> 特点:纯内网使用,无需外网;核心功能零依赖,只要装好 Node.js 就能跑,
 > 另有三个可选依赖用于增强「低清预览 / 批量打包 / WebDAV 挂载」体验(见下表)。
 > 服务默认按 **IPv4 + IPv6 双栈**监听(系统没启用 IPv6 时自动退回 IPv4),
 > 启动时会把本机各局域网地址(含 IPv6)都列出来;还可以在网页端给**主共享**加一道
@@ -97,6 +96,30 @@ lan-file-share/
 > 首次在**局域网设备**上打开时,浏览器会因自签名证书报警告(见第四节);主共享若设了
 > 「根目录访问密码」,还会先弹出用户名/密码框(用户名随便填,只需要密码,见第七节)。
 
+### Linux / macOS 部署要点
+
+Linux 上**完全可用**(核心就是一个 Node 脚本,没有 Windows 专有依赖),但有几处和 Windows 不同:
+
+```bash
+git clone https://github.com/zsy1023/lan-file-share.git
+cd lan-file-share
+./setup.sh          # 仓库已带可执行位;若从旧的克隆里更新,用 bash setup.sh 或 chmod +x setup.sh
+
+# 不想跑一键安装、只想起服务:
+node server.js
+```
+
+| 注意点 | 说明 |
+|---|---|
+| **Node 版本** | 建议 **Node 20 / 22 LTS**。Linux 的「递归目录监视」(实时静默同步)需要 Node ≥ 19.1;Node 18 上启动会提示「当前文件系统不支持递归目录监视」,此时只有本服务自己的写入会实时同步,其余功能不受影响 |
+| **OpenSSL** | `gen-cert.js` 用了 `openssl req -addext`,需要 **OpenSSL ≥ 1.1.1**(Ubuntu 20.04+ / Debian 11+ / RHEL 8+ 自带即满足;CentOS 7 的 1.0.2 会失败) |
+| **防火墙** | `sudo ufw allow 8443/tcp`(Fedora:`sudo firewall-cmd --add-port=8443/tcp --permanent && sudo firewall-cmd --reload`)。**单独分享的端口**(默认从 9000 起)也要放行 |
+| **证书信任** | 见第四节「方式 B」里的 Linux 命令(Debian/Ubuntu 用 `update-ca-certificates`,Fedora/RHEL 用 `update-ca-trust`);Chrome / Firefox 可能还有各自的证书库 |
+| **低端口** | `port` < 1024 需要 root 或 `setcap`;默认 8443 不受影响 |
+| **后台常驻** | `setup.sh` 是前台运行;要常驻可用 `nohup node server.js > log.txt 2>&1 &`、`screen` / `tmux`,或自行写一个 systemd 服务 |
+| **仅 Windows 的功能** | 分享面板里的「📂 分享本机其他文件夹…」用 Windows 原生文件夹选择框,Linux 上会提示失败,改为**手动填写绝对路径**(功能本身照常可用) |
+| **文件名差异** | Linux 允许文件名里含 `\`,而程序会把 `\` 当路径分隔符归一化,这类文件名在网页上可能打不开(极罕见) |
+
 ---
 
 ## 三、局域网设备如何用
@@ -143,10 +166,21 @@ lan-file-share/
 - **iPhone/iPad**:把 `server.crt` 用邮件 / 浏览器 / 数据线传上设备 → 设置描述文件并安装 →
   再到“设置-通用-关于本机-证书信任设置”里**启用完全信任**。
 - **macOS**:双击 `server.crt` → 钥匙串访问 → 把证书标记为“始终信任”。
+- **Linux**(装进系统信任库):
+  ```bash
+  # Debian / Ubuntu
+  sudo cp certs/server.crt /usr/local/share/ca-certificates/lan-file-share.crt
+  sudo update-ca-certificates
 
-> 说明:证书里已自动包含本机在局域网内的 IPv4 地址和 `localhost`
+  # Fedora / RHEL / CentOS
+  sudo cp certs/server.crt /etc/pki/ca-trust/source/anchors/lan-file-share.crt
+  sudo update-ca-trust
+  ```
+  浏览器可能还有自己的证书库:Firefox 需在「设置 → 隐私与安全 → 证书 → 查看证书 → 证书颁发机构 → 导入」里单独导入一次。
+
+> 说明:证书里已自动包含本机在局域网内的 **IPv4 与 IPv6 地址**以及 `localhost`
 > (生成时实时扫描网卡),一般无需手动改;若后来又换网段,请删除 `certs/*` 后重新运行
-> `node gen-cert.js` 或再次运行 `start.bat`。
+> `node gen-cert.js` 或再次运行 `start.bat` / `setup.sh`。
 
 ---
 
