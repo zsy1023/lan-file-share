@@ -25,6 +25,9 @@
  *   - 上传文件名不允许包含路径分隔符
  *   - 单独分享可设读写/只读口令;主共享可选「根目录访问密码」(只拦局域网来源,
  *     本机访问免输);除此之外没有账号体系,仅适用于可信局域网,请勿暴露到公网
+ *   - 跨站请求防CSRF:非 GET/HEAD 一律校验 Origin / Sec-Fetch-Site,JSON 接口只收
+ *     application/json(表单伪造的 text/plain 正文不解析)——「仅限本机」挡不住跨站表单
+ *   - 打包结果按作用域隔离:zipId 只能在其创建所在的主端口/分享端口使用
  */
 
 const https = require('node:https');
@@ -425,9 +428,14 @@ function zipNameFor(items, url) {
   return items.length === 1 ? `${items[0].zipRoot}.zip` : `${dirName}_${items.length}项.zip`;
 }
 
+/** 当前请求所属的作用域:'main' 或 shareId。打包结果只允许在创建它的作用域里取/查。 */
+function scopeOf(ctx) {
+  return ctx && ctx.kind === 'main' ? 'main' : ((ctx && ctx.shareId) || 'share');
+}
+
 /** 用一个稳定 key 表示"这次选择",便于重复请求复用同一个包。 */
 function zipKeyOf(ctx, url, items) {
-  const scope = ctx.kind === 'main' ? 'main' : (ctx.shareId || 'share');
+  const scope = scopeOf(ctx);
   const dir = (url.searchParams.get('dir') || '').replace(/\\/g, '/');
   return `${scope}|${dir}|${items.map((x) => x.rel + (x.isDir ? '/' : '')).join('\n')}`;
 }
@@ -489,6 +497,7 @@ async function handleZipPrepare(ctx, req, res, url) {
   const file = path.join(ZIP_TMP_DIR, `${id}.zip`);
 
   const entry = { id, file, name: zipName, size: 0, ready: false, error: '', at: Date.now(),
+                  scope: scopeOf(ctx),   // 记录归属作用域:别的端口/分享不能拿这个 id 来取
                   key, total: 0, added: 0, items: items.length };
   zips.set(id, entry);
 
@@ -540,7 +549,8 @@ async function handleZipPrepare(ctx, req, res, url) {
 /** 查询打包进度(以及打包完成后「下载阶段」的真实传输进度)。 */
 function handleZipStatus(ctx, req, res, url) {
   const z = zips.get(String(url.searchParams.get('id') || ''));
-  if (!z) return sendJson(res, 404, { ok: false, error: '打包任务不存在或已过期' });
+  // 只认自己作用域里的任务:别的分享端口/主端口拿同一个 id 来查一律当作“不存在”
+  if (!z || z.scope !== scopeOf(ctx)) return sendJson(res, 404, { ok: false, error: '打包任务不存在或已过期' });
   const x = z.xfer;
   const sent = x ? Math.min(x.sent, x.total) : 0;
   return sendJson(res, 200, {
@@ -557,7 +567,8 @@ function handleZipStatus(ctx, req, res, url) {
 /** 第二步:按 Range 下发已打包好的 ZIP(支持断点续传)。 */
 async function handleZipGet(ctx, req, res, url) {
   const z = zips.get(String(url.searchParams.get('id') || ''));
-  if (!z) throw new HttpError(404, '打包任务不存在或已过期,请重新打包');
+  // 同上:打包结果只能由“创建它的那个作用域”取,避免跨分享越权下载
+  if (!z || z.scope !== scopeOf(ctx)) throw new HttpError(404, '打包任务不存在或已过期,请重新打包');
   if (z.error) throw new HttpError(500, `打包失败: ${z.error}`);
   if (!z.ready) throw new HttpError(409, '压缩包还在生成中,请稍候');
 
@@ -2062,7 +2073,9 @@ const EXTERNAL_DENY_FIRST = new Set([
   'windows', 'program files', 'program files (x86)', 'programdata', 'users',
   'documents and settings', 'system volume information', 'recovery', 'perflogs',
   '$recycle.bin', 'msocache', 'intel', 'nvidia',
-  'etc', 'bin', 'sbin', 'boot', 'dev', 'proc', 'sys', 'usr', 'var', 'root', 'lib',
+  // Linux / macOS 的系统与用户目录:即使被误选也不允许整目录开成分享
+  'etc', 'bin', 'sbin', 'boot', 'dev', 'proc', 'sys', 'usr', 'var', 'root', 'lib', 'lib64',
+  'home', 'opt', 'srv', 'mnt', 'media', 'run', 'snap', 'lost+found', 'private', 'system',
 ]);
 function assertSafeExternalRoot(abs) {
   const norm = path.resolve(abs);
@@ -4644,6 +4657,32 @@ function isLocalRequest(req) {
   return false;
 }
 
+/**
+ * 判断请求是不是“跨站发起”的(CSRF 防护用)。
+ *
+ * 为什么需要:本服务不用 cookie,管理接口只靠「TCP 源地址是本机」放行。但管理员在**本机浏览器**
+ * 打开恶意页面时,对方用 `enctype=text/plain` 的表单 POST 到 https://127.0.0.1:8443/api/share/create,
+ * 源地址同样是本机,于是能凭空创建一个指向任意目录、无口令、监听 0.0.0.0 的外部分享。
+ *
+ * 浏览器对跨站提交一定会带上 `Origin`(非 GET)或 `Sec-Fetch-Site`,脚本伪造不了这两个头:
+ *   - `Sec-Fetch-Site: cross-site` → 判定跨站;
+ *   - `Origin` 与本次请求的 `Host` 不一致(含 `Origin: null`)→ 判定跨站。
+ * 非浏览器客户端(curl / 脚本)不带这两个头,保持放行(它们不存在“被钓鱼”的问题)。
+ */
+function isCrossSiteRequest(req) {
+  const site = String(req.headers['sec-fetch-site'] || '').toLowerCase();
+  if (site === 'cross-site') return true;
+  const origin = req.headers.origin;
+  if (origin === undefined) return false;
+  try {
+    const o = new URL(String(origin));
+    const host = String(req.headers.host || '').toLowerCase();
+    return o.host.toLowerCase() !== host;
+  } catch {
+    return true;   // Origin: null(沙箱 iframe / file:// 等)或畸形值
+  }
+}
+
 /* ---------------- 分享管理接口(仅本机) ---------------- */
 
 /** 读取请求体(限长,防滥用),返回解析后的 JSON(允许为空)。 */
@@ -4659,6 +4698,10 @@ function readJsonBody(req, limit = 16 * 1024) {
     req.on('end', () => {
       const s = Buffer.concat(chunks).toString('utf8').trim();
       if (!s) return resolve({});
+      // 只接受 application/json:表单能发出的 text/plain / urlencoded 正文一律当作“没有参数”。
+      // 这是 CSRF 的纵深防御 —— 就算某天 Origin 检查被绕过,表单也构造不出有效的管理请求。
+      const ct = String(req.headers['content-type'] || '').toLowerCase();
+      if (!ct.includes('application/json')) return resolve({});
       try { resolve(JSON.parse(s)); } catch { resolve({}); }
     });
     req.on('error', () => resolve({}));
@@ -4899,6 +4942,13 @@ async function handleRequest(ctx, req, res) {
   const url = new URL(req.url, 'https://x');
   const p = url.pathname;
   const started = Date.now();
+
+  // CSRF 防护:凡是有副作用的请求,先看它是不是从别的站点发起的(见 isCrossSiteRequest)。
+  // 放在最前面 —— 管理接口、上传、删除、重命名、建目录等全部经由此处拦下。
+  if (!/^(GET|HEAD|OPTIONS)$/i.test(req.method) && isCrossSiteRequest(req)) {
+    logAction({ action: 'deny', ctx, req, ok: false, status: 403, detail: '跨站请求被拒绝(CSRF 防护)' });
+    return sendJson(res, 403, { ok: false, error: '拒绝跨站请求:请在本站页面内操作' });
+  }
 
   // 主端口「根目录访问密码」:只拦局域网来的请求,本机(回环与本机网卡 IP)免输
   if (ctx.kind === 'main' && rootPwdHash && !isLocalRequest(req)) {

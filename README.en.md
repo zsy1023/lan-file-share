@@ -644,6 +644,17 @@ npm start                   # start
   and viewing logs all verify that the TCP peer address belongs to this machine
   (loopback or one of its own NIC IPs); other devices get 403, and forging
   `X-Forwarded-For` has no effect.
+- **Cross-site request protection (CSRF)**: every non-`GET/HEAD` request is checked
+  against `Origin` and `Sec-Fetch-Site`; anything coming from **another site** (including
+  `Origin: null`) is rejected with 403, and JSON endpoints additionally **only accept
+  `Content-Type: application/json`** — the `text/plain` / `x-www-form-urlencoded` bodies a
+  form can produce are never parsed. This closes the chain "admin opens a malicious page
+  in the local browser → it submits an `enctype=text/plain` form to /api/share/create →
+  an external share of an arbitrary directory is created without a password": the
+  peer address of such a request *is* local, so "local only" alone cannot stop it.
+- **Packaged results are scoped**: `/api/download-zip/status` and `/get` verify which
+  scope owns the task, so another share port (or the main port) gets a 404 even with a
+  valid zipId — no cross-scope downloads.
 - **Root access password (optional, see section 7)**: once set, **every request from a
   non-local source** on the main port is challenged with HTTP Basic first. The password
   is stored as a **salted scrypt hash** (never plaintext) and compared in **constant
@@ -721,6 +732,11 @@ npm start                   # start
   fallback, rendered via `textContent` so nothing executes, images/videos/text pageable together)
 - ✅ Single-file direct download (a one-file selection is no longer packaged, saving both the wait
   and the temporary disk usage)
+- ✅ CSRF protection (non-GET/HEAD requests are checked against Origin / Sec-Fetch-Site and
+  cross-site ones get 403; JSON endpoints only accept `application/json`; reproduced with an
+  external-Origin `text/plain` form PoC and verified closed)
+- ✅ Packaged results scoped to their owner (another port gets 404 for both status and download,
+  same-scope keeps working)
 - ✅ Faster packaging (already-compressed formats stored as-is + fastest deflate for the rest:
   measured 160 MB / 220 files from 7.2 s to 0.7 s)
 - ✅ Real download progress (byte-accurate server counters polled by the page: packaging →
